@@ -1,0 +1,124 @@
+# 由 scripts/deploy.sh 部署；目录、显卡分配来自 .env（scripts/hosts/<机器>.env 覆盖进去）
+# 每台机三个容器（同一个 talk-demo 镜像跑 control / node 两种角色）：
+#   talk-control：对外 https 8443，调度 + 素材分发，不用 GPU（只在控制面机器上起）
+#   talk-node   ：本机所有 OpenTalking 实例 + 节点网关（内网 8301），向 CONTROL_URL 心跳
+#   talk-tts    ：本地语音合成（VoxCPM2），节点网关经 127.0.0.1:8302 调
+# 渲染（OpenTalking/QuickTalk）和语音合成（talk-tts）必须分卡：同卡会把渲染拖垮
+x-talk: &talk
+  build:
+    context: .
+    network: host           # bridge 网络下载只有 ~130KB/s，host 网络 16MB/s
+  image: talk-demo:latest
+  network_mode: host          # WebRTC 媒体走 UDP 随机端口，host 网络最省事
+  user: "${TALK_UID:-1000}:${TALK_GID:-1000}"
+  restart: unless-stopped
+  env_file: .env
+  volumes:
+    - ${TALK_HOME:-/mnt/hdd-16t/wwang/talk}/models:/w/models
+    - ${TALK_HOME:-/mnt/hdd-16t/wwang/talk}/avatars:/w/avatars
+    - ${TALK_HOME:-/mnt/hdd-16t/wwang/talk}/cache:/w/cache
+    - ${TALK_HOME:-/mnt/hdd-16t/wwang/talk}/certs:/w/certs
+    - ${TALK_HOME:-/mnt/hdd-16t/wwang/talk}/logs:/w/logs
+    - ${TALK_HOME:-/mnt/hdd-16t/wwang/talk}/state:/w/state
+    - ${TALK_HOME:-/mnt/hdd-16t/wwang/talk}/data:/w/data
+    # 网关和入口脚本直接挂源码：改了只需重启容器，不用重建镜像（镜像里也有一份，作兜底）
+    - ./gateway:/app/gateway:ro
+    - ./entrypoint.sh:/app/entrypoint.sh:ro
+
+services:
+  control:
+    <<: *talk
+    container_name: talk-control
+    environment:
+      ROLE: control
+
+  talk:
+    <<: *talk
+    container_name: talk-node
+    environment:
+      ROLE: node
+      NVIDIA_VISIBLE_DEVICES: "${TALK_GPU:-0,1}"   # 容器内 cuda:0=GPU0、cuda:1=GPU1，各进程用哪张见 .env
+    runtime: nvidia
+
+  # 本地语音合成（VoxCPM2 + nano-vllm-voxcpm，多路并发），网关通过 127.0.0.1:8302 调
+  tts:
+    build:
+      context: ${TTS_HOME:-/mnt/hdd-16t/wwang/tts}/build
+      network: host
+    image: talk-tts:latest
+    container_name: talk-tts
+    network_mode: host
+    # 镜像默认只听 127.0.0.1；合成池跨机（LOCAL_TTS_URLS）要别的节点能连，改听 0.0.0.0（内网，无鉴权，别暴露到公网）
+    command: ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8302"]
+    user: "${TALK_UID:-1000}:${TALK_GID:-1000}"
+    restart: unless-stopped
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${TTS_GPU:-0}"
+      HOME: /w/cache/home
+      USER: talk                                  # torch inductor 要用户名，容器里的 uid 没有 passwd 记录
+      TORCHINDUCTOR_CACHE_DIR: /w/cache/inductor
+      TRITON_CACHE_DIR: /w/cache/triton
+      VOX_GPU_MEM: "${VOX_GPU_MEM:-0.5}"          # 205：24G×0.5 + CUDA graph 2.5G，同卡还有网关识别
+      VOX_MAX_SEQS: "${VOX_MAX_SEQS:-32}"         # 最大并发；CUDA graph 按它捕获，显存小的卡要调低
+      VOX_MAX_BATCHED_TOKENS: "${VOX_MAX_BATCHED_TOKENS:-8192}"   # 一次 prefill 的 token 上限，影响显存峰值
+      VOX_MAX_MODEL_LEN: "${VOX_MAX_MODEL_LEN:-4096}"
+      VOX_EAGER: "${VOX_EAGER:-0}"
+      VOX_DEVICES: "${VOX_DEVICES:-0}"            # 容器内卡号列表，和 TTS_GPU 的张数对应
+      VOX_MAX_GEN: "${VOX_MAX_GEN:-2000}"
+      VOX_DTYPE: "${VOX_DTYPE:-bfloat16}"         # Volta（206 TITAN V）没有 bf16 → float16
+      VOX_STYLE_MODE: "${VOX_STYLE_MODE:-ultimate}"     # 带风格指令时的克隆模式：ref=只给参考 latents；ultimate=再加续写提示（音色更稳，实验）
+      VOX_ATTN: "${VOX_ATTN:-}"                   # sdpa：不用 flash-attn（Volta 不支持），LongRoPE 也换 PyTorch 实现
+      TORCHDYNAMO_DISABLE: "${VOX_NO_COMPILE:-0}" # 1：关掉 torch.compile（Volta 上 Triton 编不了 bf16）
+      NANOVLLM_SERVERPOOL_NUM_KVCACHE_BLOCKS: "${VOX_KV_BLOCKS:-}"   # 手动定 KV 块数（256 token/块），空=自动
+    runtime: nvidia
+    volumes:
+      - ${TTS_HOME:-/mnt/hdd-16t/wwang/tts}/models:/w/models:ro
+      - ${TTS_HOME:-/mnt/hdd-16t/wwang/tts}/presets:/w/tts/presets
+      - ${TTS_HOME:-/mnt/hdd-16t/wwang/tts}/cache:/w/cache
+      - ${TALK_HOME:-/mnt/hdd-16t/wwang/talk}/state:/w/state:ro   # 克隆音色的录音和登记表（节点从控制面拉来的 wav 也放这里）
+
+  # ---- 评估中的两条"整脸/整头"渲染路线（2026-10-22），只在 DEPLOY_SERVICES 列出时启动 ----
+  # SoulX-FlashHead-1.3B：OpenTalking flashhead 模型的推理端（WebSocket :8766）。和 talk-tts 共用 GPU0（约 5G 显存）
+  flashhead:
+    build:
+      context: ${FLASHHEAD_HOME:-/data/flashhead}/build
+      network: host
+    image: talk-flashhead:latest
+    container_name: talk-flashhead
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${FLASHHEAD_GPU:-0}"
+      FLASHHEAD_MODEL_TYPE: "${FLASHHEAD_MODEL_TYPE:-lite}"
+      HF_HUB_OFFLINE: "1"
+    runtime: nvidia
+    volumes:
+      - ${FLASHHEAD_HOME:-/data/flashhead}/src/SoulX-FlashHead:/app/SoulX-FlashHead:ro
+      - ${FLASHHEAD_HOME:-/data/flashhead}/models:/w/models:ro
+      - ${FLASHHEAD_HOME:-/data/flashhead}/cache:/root/.cache
+
+  # OmniRT + FasterLivePortrait（JoyVASA 音频驱动 + LivePortrait 变形）：OpenTalking fasterliveportrait 模型的推理端（HTTP/WS :9000）
+  # 基础镜像用 FasterLivePortrait 作者的 docker（带 TensorRT 8 + grid_sample 插件 + 定制 onnxruntime），OmniRT 装在上面
+  omnirt:
+    build:
+      context: ${OMNIRT_HOME:-/data/omnirt}/build
+      network: host
+    image: talk-omnirt:latest
+    container_name: talk-omnirt
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "${OMNIRT_GPU:-1}"
+      OMNIRT_FASTLIVEPORTRAIT_RUNTIME: "1"
+      OMNIRT_FASTLIVEPORTRAIT_LOAD_MODELS: "1"
+      OMNIRT_FASTLIVEPORTRAIT_ROOT: /app/FasterLivePortrait
+      OMNIRT_FASTLIVEPORTRAIT_CHECKPOINTS_DIR: /w/checkpoints
+      OMNIRT_FASTLIVEPORTRAIT_CFG: "${OMNIRT_FLP_CFG:-configs/trt_infer.yaml}"
+      OMNIRT_FASTLIVEPORTRAIT_DEVICE: cuda
+      OMNIRT_FASTLIVEPORTRAIT_WORK_DIR: /w/work
+    runtime: nvidia
+    volumes:
+      - ${OMNIRT_HOME:-/data/omnirt}/src/omnirt:/app/omnirt:ro
+      - ${OMNIRT_HOME:-/data/omnirt}/src/FasterLivePortrait:/app/FasterLivePortrait
+      - ${OMNIRT_HOME:-/data/omnirt}/checkpoints:/w/checkpoints
+      - ${OMNIRT_HOME:-/data/omnirt}/work:/w/work

@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>数字人控制面</title>
+<style>
+  :root{
+    --bg:#f2f2f7; --card:#fff; --fg:#1c1c1e; --muted:#6e6e73; --line:#e5e5ea; --soft:#f5f5f7;
+    --blue:#0a84ff; --green:#34c759; --orange:#ff9f0a; --red:#ff3b30; --purple:#af52de;
+    --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#000; --card:#1c1c1e; --fg:#f2f2f7; --muted:#8e8e93; --line:#2c2c2e; --soft:#2c2c2e}
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 var(--font)}
+  .wrap{max-width:1280px;margin:0 auto;padding:16px}
+  header{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;margin-bottom:14px}
+  header h1{font-size:20px;margin:0;font-weight:700}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;background:var(--soft);color:var(--muted)}
+  .pill b{color:var(--fg);font-weight:600}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);display:inline-block}
+  .dot.ok{background:var(--green)} .dot.warn{background:var(--orange)} .dot.bad{background:var(--red)}
+  .spacer{flex:1}
+  .stale{color:var(--red);font-size:12px}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(150px,100%),1fr));gap:10px;margin-bottom:14px}
+  .tile{background:var(--card);border-radius:14px;padding:12px 14px}
+  .tile .k{font-size:12px;color:var(--muted)} .tile .v{font-size:26px;font-weight:700;line-height:1.2;margin-top:2px}
+  .tile .s{font-size:12px;color:var(--muted)}
+  h2{font-size:15px;margin:18px 0 8px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr));gap:12px}
+  .card{background:var(--card);border-radius:16px;padding:14px 16px;min-width:0;overflow:hidden}
+  .card h3{margin:0 0 8px;font-size:16px;display:flex;align-items:center;gap:8px}
+  .card h3 small{font:12px var(--mono);color:var(--muted);font-weight:400}
+  .row{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--muted);margin-bottom:8px}
+  .bar{height:6px;border-radius:3px;background:var(--soft);overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--blue);border-radius:3px;transition:width .4s}
+  .bar i.warn{background:var(--orange)} .bar i.bad{background:var(--red)} .bar i.ok{background:var(--green)}
+  .gpu{display:grid;grid-template-columns:minmax(0,auto) minmax(60px,1fr) auto;gap:4px 10px;align-items:center;font-size:12px;margin:4px 0}
+  .gpu .n{color:var(--muted);white-space:nowrap} .gpu .m{font-family:var(--mono);color:var(--muted);white-space:nowrap}
+  .insts{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px;margin-top:8px}
+  .inst{background:var(--soft);border-radius:10px;padding:8px 10px;font-size:12px}
+  .inst .t{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+  .inst .t b{font-weight:600} .inst .num{font-family:var(--mono)}
+  .inst.off{opacity:.55}
+  .tts{font-size:12px;color:var(--muted);margin-top:8px;display:flex;flex-wrap:wrap;gap:4px 12px}
+  .tts code{font:11px var(--mono);background:var(--soft);padding:1px 5px;border-radius:4px}
+  .tts .down{color:var(--red)}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--muted);font-weight:500;font-size:12px}
+  td.mono,.mono{font-family:var(--mono);font-size:12px}
+  .tag{display:inline-block;padding:1px 7px;border-radius:6px;font-size:11px;background:var(--soft);color:var(--muted)}
+  .tag.live{background:rgba(52,199,89,.15);color:var(--green)} .tag.speaking{background:rgba(10,132,255,.15);color:var(--blue)}
+  .tag.created{background:rgba(255,159,10,.15);color:var(--orange)} .tag.err{background:rgba(255,59,48,.15);color:var(--red)}
+  .scroll{overflow:auto;max-height:420px}
+  .feed{list-style:none;margin:0;padding:0;font-size:13px}
+  .feed li{display:grid;grid-template-columns:62px 52px 1fr;gap:8px;padding:5px 0;border-bottom:1px solid var(--line)}
+  .feed .t{font-family:var(--mono);color:var(--muted);font-size:12px}
+  .feed .k{font-size:11px;color:var(--muted)}
+  .feed .k.session{color:var(--blue)} .feed .k.node{color:var(--orange)} .feed .k.control{color:var(--red)} .feed .k.turn{color:var(--purple)} .feed .k.job{color:var(--green)} .feed .k.persona{color:var(--purple)}
+  .card code{font:12px var(--mono);background:var(--soft);padding:1px 5px;border-radius:4px}
+  .empty{color:var(--muted);font-size:13px;padding:8px 0}
+  @media (max-width:640px){ .wrap{padding:10px} .grid{grid-template-columns:1fr} th:nth-child(5),td:nth-child(5){display:none} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>数字人控制面</h1>
+    <span class="pill" id="selfPill"><span class="dot" id="selfDot"></span><b id="selfRole">—</b><span id="selfUrl"></span></span>
+    <span class="pill">LLM <b id="provider">—</b></span>
+    <span class="pill" id="peerPill" hidden>另一控制面 <b id="peerUrl"></b></span>
+    <span class="spacer"></span>
+    <span class="stale" id="stale" hidden>数据没更新</span>
+    <span class="pill"><span id="clock">—</span></span>
+  </header>
+
+  <div class="tiles">
+    <div class="tile"><div class="k">在线会话 / 上限</div><div class="v"><span id="online">0</span><span class="s"> / <span id="maxOnline">0</span></span></div><div class="bar" style="margin-top:6px"><i id="onlineBar" style="width:0"></i></div></div>
+    <div class="tile"><div class="k">正在说话</div><div class="v" id="talking">0</div><div class="s">/v1 会话中 speaking 的</div></div>
+    <div class="tile"><div class="k">可用渲染实例</div><div class="v" id="instances">0</div><div class="s" id="instancesNote">就绪 / 总数</div></div>
+    <div class="tile"><div class="k">节点</div><div class="v" id="nodesUp">0</div><div class="s" id="nodesNote">在线 / 已注册</div></div>
+    <div class="tile"><div class="k">合成并发</div><div class="v" id="ttsInflight">0</div><div class="s" id="ttsNote">各机合成池 inflight 合计</div></div>
+  </div>
+
+  <h2>节点</h2>
+  <div class="grid" id="nodes"></div>
+
+  <h2>会话 <span class="mono" id="sessCount"></span></h2>
+  <div class="card scroll"><table><thead><tr><th>会话</th><th>节点</th><th>状态</th><th>形象</th><th>音色</th><th>biz_ref</th><th>时长</th><th>说话</th><th>轮次</th></tr></thead><tbody id="sessions"></tbody></table><div class="empty" id="sessEmpty" hidden>没有 /v1 会话</div><div class="empty" id="demoNote" hidden></div></div>
+
+  <h2>人设（多模态素材 → 结构化） <span class="mono" id="psCount"></span></h2>
+  <div class="card scroll"><table><thead><tr><th>人设</th><th>状态</th><th>版本</th><th>素材</th><th>知识</th><th>prompt</th><th>biz_ref</th><th>更新</th></tr></thead><tbody id="personas"></tbody></table><div class="empty" id="psEmpty" hidden>还没有人设。后端 <code>POST /v1/personas</code> 建一个，再 <code>POST /v1/personas/{id}/materials</code> 传文档 / 图片 / 音频 / 视频 / 网址</div>
+    <div id="psJobs" style="margin-top:8px"></div></div>
+
+  <div class="grid" style="margin-top:12px">
+    <div class="card"><h3>最近事件</h3><div class="scroll"><ul class="feed" id="events"></ul></div></div>
+    <div class="card"><h3>建形象任务</h3><div class="scroll"><table><thead><tr><th>名称</th><th>状态</th><th>步骤</th><th>形象</th><th>耗时</th></tr></thead><tbody id="jobs"></tbody></table><div class="empty" id="jobsEmpty" hidden>没有任务</div></div></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmtDur = (s) => { s = Math.max(0, Math.round(s)); return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s/60)}m${String(s%60).padStart(2,"0")}s` : `${Math.floor(s/3600)}h${Math.floor(s%3600/60)}m`; };
+const hhmmss = (ts) => new Date(ts * 1000).toTimeString().slice(0, 8);
+const lvl = (p) => p >= 90 ? "bad" : p >= 70 ? "warn" : "";
+let lastOk = 0, serverNow = 0;
+
+function nodeCard(n) {
+  const alive = n.alive && n.age < 15;
+  const ready = n.instances.filter(i => i.ready).length;
+  const online = n.instances.reduce((a, i) => a + i.online, 0), cap = n.instances.reduce((a, i) => a + i.cap, 0);
+  const gpus = n.gpus.map(g => {
+    const mp = g.mem_total ? Math.round(g.mem_used / g.mem_total * 100) : 0;
+    return `<div class="gpu"><span class="n">GPU${g.index} ${esc(g.name)}</span>
+      <div><div class="bar" title="算力 ${g.util}%"><i class="${lvl(g.util)}" style="width:${g.util}%"></i></div>
+      <div class="bar" style="margin-top:3px;opacity:.7" title="显存 ${mp}%"><i class="${lvl(mp)}" style="width:${mp}%"></i></div></div>
+      <span class="m">${g.util}% · ${(g.mem_used/1024).toFixed(1)}/${(g.mem_total/1024).toFixed(0)}G</span></div>`;
+  }).join("") || `<div class="empty">没有 GPU 数据</div>`;
+  const insts = n.instances.map(i => {
+    const p = i.cap ? Math.round(i.online / i.cap * 100) : 0;
+    return `<div class="inst ${i.ready ? "" : "off"}"><div class="t"><b>实例 ${i.idx}</b><span class="dot ${i.ready ? "ok" : "warn"}" title="${i.ready ? "就绪" : "预热中"}"></span></div>
+      <div class="num">${i.online}${i.cap ? " / " + i.cap : ""}</div><div class="bar" style="margin-top:4px"><i class="${lvl(p)}" style="width:${p}%"></i></div>
+      <div style="color:var(--muted);margin-top:3px">预热 ${i.warm.length} 形象</div></div>`;
+  }).join("");
+  const t = n.tts || {}, inflight = t.inflight || {};
+  const tts = (t.urls || []).map((u, k) => {
+    const down = (t.down || []).includes(u);
+    return `<span class="${down ? "down" : ""}"><code>${esc(u.replace("http://", ""))}</code> ${down ? "连不上" : (inflight[u] || 0) + (k === 0 && t.max ? "/" + t.max : "") + " 路"}</span>`;
+  }).join("");
+  return `<div class="card"><h3><span class="dot ${alive ? "ok" : "bad"}"></span>节点 ${esc(n.id)} ${n.draining ? '<span class="tag">draining</span>' : ""}<small>${esc(n.url)}</small></h3>
+    <div class="row"><span>在线 <b>${online}</b> / ${cap}</span><span>实例就绪 <b>${ready}</b> / ${n.instances.length}</span><span>形象 ${n.avatars}</span><span>心跳 ${alive ? n.age + "s 前" : "<b style='color:var(--red)'>" + fmtDur(n.age) + " 前</b>"}</span>${n.up_since ? `<span>注册于 ${hhmmss(n.up_since)}</span>` : ""}</div>
+    ${gpus}<div class="insts">${insts}</div>${tts ? `<div class="tts">合成池：${tts}</div>` : ""}</div>`;
+}
+
+function render(d) {
+  serverNow = d.now;
+  const c = d.control;
+  $("selfRole").textContent = (c.primary ? "主控制面" : "备控制面") + (c.active ? "·受理中" : "·待命");
+  $("selfDot").className = "dot " + (c.active ? "ok" : "warn");
+  $("selfUrl").textContent = c.self.replace("https://", "");
+  $("provider").textContent = c.provider;
+  const peer = (c.controls || []).find(u => u !== c.self);
+  $("peerPill").hidden = !peer; if (peer) $("peerUrl").textContent = peer.replace("https://", "");
+  const cap = d.capacity;
+  $("online").textContent = cap.online; $("maxOnline").textContent = cap.max_online;
+  $("onlineBar").style.width = (cap.max_online ? cap.online / cap.max_online * 100 : 0) + "%";
+  $("onlineBar").className = lvl(cap.max_online ? cap.online / cap.max_online * 100 : 0);
+  $("talking").textContent = cap.talking;
+  const totalInst = d.nodes.reduce((a, n) => a + n.instances.length, 0);
+  $("instances").textContent = cap.instances; $("instancesNote").textContent = `就绪 / 总数 ${totalInst}`;
+  const up = d.nodes.filter(n => n.alive).length;
+  $("nodesUp").textContent = up; $("nodesNote").textContent = `在线 / 已注册 ${d.nodes.length}`;
+  let inflight = 0, downs = 0;
+  d.nodes.forEach(n => { const t = n.tts || {}; inflight += Object.values(t.inflight || {}).reduce((a, b) => a + b, 0); downs += (t.down || []).length; });
+  $("ttsInflight").textContent = inflight; $("ttsNote").textContent = downs ? `有 ${downs} 个合成服务连不上` : "各机合成池 inflight 合计";
+
+  $("nodes").innerHTML = d.nodes.sort((a, b) => a.id.localeCompare(b.id)).map(nodeCard).join("") || `<div class="card empty">还没有节点心跳</div>`;
+
+  $("sessions").innerHTML = d.sessions.map(s => {
+    const u = s.usage || {}; const dur = s.created_at ? d.now - s.created_at : u.duration_s;
+    const st = s.speaking ? '<span class="tag speaking">说话中</span>' : `<span class="tag ${s.state}">${{live:"通话中",created:"连接中",ended:"已结束"}[s.state] || s.state}</span>`;
+    return `<tr><td class="mono">${esc(s.id)}</td><td class="mono">${esc(s.node_id || "")}</td><td>${st}</td><td>${esc(s.avatar_id)}</td><td class="mono">${esc(s.voice || "默认")}${s.dialect ? "@" + esc(s.dialect) : ""}</td><td>${esc(s.biz_ref || "")}</td><td class="mono">${fmtDur(dur)}</td><td class="mono">${u.talk_s ?? 0}s</td><td class="mono">${u.turns ?? 0}</td></tr>`;
+  }).join("");
+  $("sessEmpty").hidden = d.sessions.length > 0;
+  $("sessCount").textContent = d.sessions.length ? `(${d.sessions.length})` : "";
+  $("demoNote").hidden = !d.demo_sessions.length;
+  $("demoNote").textContent = d.demo_sessions.length ? `另有 ${d.demo_sessions.length} 个演示页 / 压测直建的会话：${d.demo_sessions.map(x => x.id + "→" + x.node).join("，")}` : "";
+
+  $("events").innerHTML = d.events.map(e => `<li><span class="t">${hhmmss(e.ts)}</span><span class="k ${esc(e.kind)}">${{session:"会话",node:"节点",control:"控制面",turn:"对话",job:"任务",persona:"人设"}[e.kind] || e.kind}</span><span>${esc(e.text)}</span></li>`).join("") || `<li class="empty">还没有事件</li>`;
+
+  const ps = d.personas || [];
+  $("personas").innerHTML = ps.map(p => {
+    const st = p.status === "approved" ? '<span class="tag live">已审核</span>' : '<span class="tag created">草稿</span>';
+    const km = p.knowledge_mode ? `<span class="tag ${p.knowledge_mode === "external" ? "err" : ""}">${p.knowledge_mode === "external" ? "外部检索" : "内联"}</span>` : '<span class="tag">未 build</span>';
+    const mats = p.materials_running ? `${p.materials} <span class="tag created">${p.materials_running} 抽取中</span>` : p.materials;
+    return `<tr><td><b>${esc(p.name)}</b> <span class="mono" style="color:var(--muted)">${esc(p.persona_id)}</span>${p.building ? ' <span class="tag created">build 中</span>' : ""}</td><td>${st}</td><td class="mono">v${p.version}</td><td>${mats}</td><td>${km}</td><td class="mono">${p.prompt_tokens ?? "—"}${p.prompt_tokens ? " tok" : ""}</td><td>${esc(p.biz_ref || "")}</td><td class="mono">${p.updated ? hhmmss(p.updated) : ""}</td></tr>`;
+  }).join("");
+  $("psEmpty").hidden = ps.length > 0;
+  $("psCount").textContent = ps.length ? `(${ps.length})` : "";
+  const pj = (d.persona_jobs || []).filter(j => j.state === "running");
+  $("psJobs").innerHTML = pj.length ? pj.map(j => `<span class="pill"><span class="dot warn"></span>${j.kind === "build" ? "合并编译" : "素材抽取"} ${esc(j.persona_id)} · ${esc(j.step)} · ${fmtDur(d.now - j.t0)}</span> `).join("") : "";
+
+  $("jobs").innerHTML = d.jobs.map(j => {
+    const st = {running:'<span class="tag created">进行中</span>', done:'<span class="tag live">完成</span>', error:'<span class="tag err">失败</span>'}[j.state] || j.state;
+    return `<tr><td>${esc(j.name)}</td><td>${st}</td><td>${esc(j.state === "error" ? (j.error || "") : j.step)}</td><td class="mono">${esc(j.avatar_id || "")}</td><td class="mono">${fmtDur((j.state === "running" ? d.now : (j.t_end || d.now)) - j.t0)}</td></tr>`;
+  }).join("");
+  $("jobsEmpty").hidden = d.jobs.length > 0;
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/api/dashboard", {cache: "no-store"});
+    if (r.status === 503) { const e = await r.json().catch(() => ({})); $("selfRole").textContent = "备控制面·待命"; $("selfDot").className = "dot warn"; $("stale").hidden = false; $("stale").textContent = "本机未受理，主控制面：" + (e.error?.primary || ""); return; }
+    if (!r.ok) throw new Error(r.status);
+    render(await r.json()); lastOk = Date.now(); $("stale").hidden = true;
+  } catch (e) {
+    if (Date.now() - lastOk > 8000) { $("stale").hidden = false; $("stale").textContent = "数据没更新（" + e.message + "）"; }
+  }
+}
+setInterval(() => { $("clock").textContent = new Date().toTimeString().slice(0, 8); }, 1000);
+tick(); setInterval(tick, 2000);
+</script>
+</body>
+</html>

@@ -1,0 +1,2605 @@
+openapi: 3.1.0
+info:
+  title: 数字人 AI 服务端接口（多机方案）
+  version: 0.1.0-draft
+  description: |
+    依据《AI服务多机方案》（2026-10-18 方案稿，尚未落地）整理的接口文档。
+
+    三组接口：
+    - `/v1/*`：给**业务后端**调（服务到服务），`Authorization: Bearer <服务密钥>`。
+    - `/rt/*`：给**前端浏览器**调（实时通话），凭后端转交的会话 ticket（`X-Session-Ticket` 头，SSE/WS 用 `?ticket=`）。ticket 绑定单个会话，短时有效，HMAC 签名无状态令牌，主备切换后仍有效。
+    - `/internal/*`：控制面 ↔ 节点内网接口，只绑内网网卡，`X-Node-Token` 鉴权。
+
+    通用约定：
+    - JSON；错误统一 `{"error":{"code","message","retry_after?"}}`。
+    - 创建类请求支持 `Idempotency-Key` 头：主备切换时后端重试不会重复建会话/形象。建会话另由节点兜底：`biz_ref` 相同且在线的会话直接返回已有 `session_id`。
+    - ID 前缀：`av_` 形象、`var_` 形象变体、`vc_` 音色、`sess_` 会话、`job_` 任务、`ps_` 人设、`mat_` 素材。
+    - AI 侧不存用户信息，后端可传 `biz_ref` 透传，用于对账和回调关联。
+    - 耗时操作（建形象 1~3 分钟、变体生成、人设构建）走「202 + job + 回调」。
+    - 备控制面不持有 VIP 时拒绝 `/v1`、`/rt`，返回 503 + `Retry-After`。
+    - `X-Request-Id` 从后端一路透传到节点。
+    - 回调（AI → 后端 `callback_url`）见 `webhooks`：带 `X-Signature: HMAC-SHA256(body, 回调密钥)` 与 `event_id`（后端按它去重），失败按 1s/5s/30s/2min 重试。
+
+servers:
+  - url: https://{vip}:8443
+    description: 控制面（VIP，主备切换对后端无感）
+    variables:
+      vip:
+        default: <CONTROL_VIP>
+  - url: http://{node_ip}:8301
+    description: 节点网关（仅内网，控制面 → 节点）
+    variables:
+      node_ip:
+        default: <GPU1_LAN_IP>
+
+tags:
+  - name: status
+    description: 状态与容量
+  - name: avatars
+    description: 形象
+  - name: variants
+    description: 形象变体（H3 本地闲时生成的底板视频）
+  - name: offline
+    description: 离线任务队列
+  - name: voices
+    description: 音色
+  - name: jobs
+    description: 异步任务
+  - name: sessions
+    description: 会话（核心，唯一有状态句柄，粘在某张卡上）
+  - name: personas
+    description: 结构化人设（多模态素材抽取）
+  - name: rt
+    description: 前端实时接口（ticket 鉴权）
+  - name: internal
+    description: 控制面 ↔ 节点内网接口（X-Node-Token）
+
+security:
+  - serviceKey: []
+
+paths:
+  # ───────────────────────── 1. 状态与容量 ─────────────────────────
+  /v1/health:
+    get:
+      tags: [status]
+      summary: 健康状态
+      operationId: getHealth
+      responses:
+        '200':
+          description: 控制面角色与各节点/实例状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          $ref: '#/components/responses/Standby'
+
+  /v1/capacity:
+    get:
+      tags: [status]
+      summary: 容量
+      description: 后端可在「开始通话」前预判是否要排队。
+      operationId: getCapacity
+      responses:
+        '200':
+          description: 当前容量
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capacity'
+        '503':
+          $ref: '#/components/responses/Standby'
+
+  # ───────────────────────── 2. 形象 ─────────────────────────
+  /v1/avatars:
+    get:
+      tags: [avatars]
+      summary: 形象列表
+      operationId: listAvatars
+      parameters:
+        - name: type
+          in: query
+          description: '`builtin` 内置形象列表'
+          schema:
+            type: string
+            enum: [builtin]
+      responses:
+        '200':
+          description: 形象列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Avatar'
+    post:
+      tags: [avatars]
+      summary: 创建形象
+      description: 上传人像照片建形象，耗时 1~3 分钟，完成后回调 `avatar.ready` / `avatar.failed`。上传校验 MIME + 像素上限；人脸检测失败回 `avatar.failed`。
+      operationId: createAvatar
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image, name]
+              properties:
+                image:
+                  type: string
+                  format: binary
+                  description: 人像图片
+                name:
+                  type: string
+                animate:
+                  type: boolean
+                  description: 是否生成动态底板
+                  default: false
+                clips:
+                  type: integer
+                  description: 动态底板分几段生成（每段 6 秒、动作不同，首尾相接循环；每段消耗一次视频额度），1~5
+                  default: 3
+                callback_url:
+                  type: string
+                  format: uri
+                biz_ref:
+                  type: string
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [avatar_id, job_id]
+                properties:
+                  avatar_id:
+                    type: string
+                    example: av_xxx
+                  job_id:
+                    type: string
+                    example: job_xxx
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          $ref: '#/components/responses/Standby'
+
+  /v1/avatars/{id}:
+    parameters:
+      - $ref: '#/components/parameters/AvatarId'
+    get:
+      tags: [avatars]
+      summary: 形象详情
+      operationId: getAvatar
+      responses:
+        '200':
+          description: 形象信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Avatar'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [avatars]
+      summary: 删除形象
+      description: 从所有节点删除。
+      operationId: deleteAvatar
+      responses:
+        '204':
+          description: 已删除
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/avatars/{id}/preview:
+    get:
+      tags: [avatars]
+      summary: 形象封面图
+      description: 返回签名 URL，前端可直接展示。
+      operationId: getAvatarPreview
+      parameters:
+        - $ref: '#/components/parameters/AvatarId'
+      responses:
+        '200':
+          description: 签名 URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                    format: uri
+                  expires_at:
+                    type: string
+                    format: date-time
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────── 2b. 形象变体 ─────────────────────────
+  /v1/avatars/{id}/variants:
+    parameters:
+      - $ref: '#/components/parameters/AvatarId'
+    post:
+      tags: [variants]
+      summary: 生成形象变体（底板视频）
+      description: |
+        同一张脸换背景/服装/姿态/待机动作，H3 本地闲时生成。
+        - `priority=idle` 只在闲时跑；`normal` 低峰即跑；`urgent` 走 MiniMax 云端 H3 API（按条计费，由后端决定）。
+        - 产物流程：生成 → 首尾帧接缝检查（不达标换种子重试最多 3 次）→ 登记为 variant → 推送到所有节点 → 各节点 prewarm → 回调 `variant.ready`。
+      operationId: createVariant
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VariantCreate'
+          multipart/form-data:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/VariantCreate'
+                - type: object
+                  properties:
+                    reference_image:
+                      type: string
+                      format: binary
+      responses:
+        '202':
+          description: 已入队
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [variant_id, job_id]
+                properties:
+                  variant_id:
+                    type: string
+                    example: var_xxx
+                  job_id:
+                    type: string
+                  eta:
+                    type: string
+                    format: date-time
+                    description: 预计完成时间
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    get:
+      tags: [variants]
+      summary: 变体列表
+      operationId: listVariants
+      responses:
+        '200':
+          description: 该形象下的变体
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Variant'
+
+  /v1/variants/{vid}:
+    parameters:
+      - $ref: '#/components/parameters/VariantId'
+    get:
+      tags: [variants]
+      summary: 变体详情
+      description: 含预览视频 URL。
+      operationId: getVariant
+      responses:
+        '200':
+          description: 变体
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Variant'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [variants]
+      summary: 删除变体
+      description: 从所有节点删除。
+      operationId: deleteVariant
+      responses:
+        '204':
+          description: 已删除
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/variants/{vid}/retry:
+    post:
+      tags: [variants]
+      summary: 重做变体
+      description: 失败/不满意时换种子重做。
+      operationId: retryVariant
+      parameters:
+        - $ref: '#/components/parameters/VariantId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                seed:
+                  type: integer
+                priority:
+                  $ref: '#/components/schemas/OfflinePriority'
+      responses:
+        '202':
+          description: 已重新入队
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  variant_id:
+                    type: string
+                  job_id:
+                    type: string
+                  eta:
+                    type: string
+                    format: date-time
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────── 2c. 离线队列 ─────────────────────────
+  /v1/offline/queue:
+    get:
+      tags: [offline]
+      summary: 离线任务队列状态
+      description: 后端做进度页用。
+      operationId: getOfflineQueue
+      responses:
+        '200':
+          description: 队列状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfflineQueue'
+
+  /v1/offline/policy:
+    patch:
+      tags: [offline]
+      summary: 调整借卡策略
+      description: 调三档阈值 / 夜间时段 / 每台最多借几张卡。
+      operationId: patchOfflinePolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OfflinePolicy'
+      responses:
+        '200':
+          description: 当前策略
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfflinePolicy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  # ───────────────────────── 3. 音色 ─────────────────────────
+  /v1/voices/presets:
+    get:
+      tags: [voices]
+      summary: 系统音色
+      description: 系统音色分组（含推荐年龄段）+ 支持的方言列表。
+      operationId: listVoicePresets
+      responses:
+        '200':
+          description: 预设音色与方言
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  groups:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        age_range:
+                          type: string
+                          description: 推荐年龄段
+                        voices:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/Voice'
+                  dialects:
+                    type: array
+                    items:
+                      type: string
+                    example: [普通话, 四川话, 粤语]
+
+  /v1/voices/clone:
+    post:
+      tags: [voices]
+      summary: 克隆音色
+      description: 上传参考音频（≤20MB，截前 20 秒）。注册后广播到所有合成节点，或合成节点首次遇到未知音色时自行向控制面拉取参考 wav。
+      operationId: cloneVoice
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [audio, name]
+              properties:
+                audio:
+                  type: string
+                  format: binary
+                  description: 参考音频，≤20MB，只取前 20 秒
+                name:
+                  type: string
+                biz_ref:
+                  type: string
+      responses:
+        '200':
+          description: 已登记
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  voice_id:
+                    type: string
+                    example: vc_xxx
+                  ref_text:
+                    type: string
+                    description: 参考音频的转写文本
+                  status:
+                    type: string
+                    enum: [processing, ready, failed]
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/voices/{id}:
+    parameters:
+      - $ref: '#/components/parameters/VoiceId'
+    get:
+      tags: [voices]
+      summary: 音色信息
+      operationId: getVoice
+      responses:
+        '200':
+          description: 音色
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Voice'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [voices]
+      summary: 删除音色
+      description: 删除所有合成节点上的该音色。
+      operationId: deleteVoice
+      responses:
+        '204':
+          description: 已删除
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/voices/{id}/preview:
+    get:
+      tags: [voices]
+      summary: 试听
+      operationId: previewVoice
+      parameters:
+        - $ref: '#/components/parameters/VoiceId'
+        - name: dialect
+          in: query
+          schema:
+            type: string
+          example: 四川话
+      responses:
+        '200':
+          description: 试听音频
+          content:
+            audio/mpeg:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────── 4. 任务 ─────────────────────────
+  /v1/jobs/{id}:
+    get:
+      tags: [jobs]
+      summary: 任务状态
+      operationId: getJob
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: job_xxx
+      responses:
+        '200':
+          description: 任务
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────── 5. 会话 ─────────────────────────
+  /v1/sessions:
+    post:
+      tags: [sessions]
+      summary: 创建会话
+      description: |
+        调度到一张空闲卡并建会话，返回 `session_id` + 一次性 `ticket`，由后端转交前端。
+        - 满员：`503 capacity_full` + `retry_after`；`queue=true` 时返回 `202 {state:"queued", position}`，排到后通过 SSE `session.state_changed` / 回调通知。
+        - `history`：断线重连 / 切换节点后接着聊，由后端把最近几轮带回来。
+        - 后端可在用户进入「准备页」时预建会话，`idle_timeout_s` 兜底回收。
+        - `persona` 用 `persona_id` 且该人设 `knowledge_mode=external` 时，必须配 `llm.mode=external`，否则 400。
+      operationId: createSession
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionCreate'
+      responses:
+        '201':
+          description: 会话已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionCreated'
+        '202':
+          description: 已排队（`queue=true`）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id:
+                    type: string
+                  state:
+                    type: string
+                    const: queued
+                  position:
+                    type: integer
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          description: 满员（`capacity_full`）或备机未持 VIP
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: capacity_full
+                  message: all instances busy
+                  retry_after: 30
+
+  /v1/sessions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    get:
+      tags: [sessions]
+      summary: 会话状态
+      operationId: getSession
+      responses:
+        '200':
+          description: 会话
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [sessions]
+      summary: 通话中修改会话
+      description: |
+        通话中换 `voice_id` / `dialect` / `system_prompt` / `variant_id`。
+        换 `variant_id`：节点上该变体已 prewarm 则在下一次待机间隙热切底板；不支持热切时兜底为同 sid 内部重建 OT 会话，前端约 1 秒过渡画面，SSE 发 `session.variant_changed`。
+      operationId: patchSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                voice_id:
+                  type: string
+                dialect:
+                  type: string
+                system_prompt:
+                  type: string
+                variant_id:
+                  type: string
+      responses:
+        '200':
+          description: 已更新
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [sessions]
+      summary: 挂断
+      description: 返回用量用于计费。用量在此处和 `session.ended` 回调各给一次，以回调为准。
+      operationId: endSession
+      responses:
+        '200':
+          description: 用量
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/sessions/{id}/speak:
+    post:
+      tags: [sessions]
+      summary: 下发文本
+      description: '`chat` 当作用户说的话走 LLM；`say` 让数字人原样念（播报、开场白）。`llm.mode=none` 时只支持 `say`。'
+      operationId: sessionSpeak
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, mode]
+              properties:
+                text:
+                  type: string
+                mode:
+                  type: string
+                  enum: [chat, say]
+      responses:
+        '202':
+          description: 已接受
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 会话不在 live 状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/sessions/{id}/interrupt:
+    post:
+      tags: [sessions]
+      summary: 打断当前说话
+      operationId: sessionInterrupt
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '204':
+          description: 已打断
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/sessions/{id}/ticket:
+    post:
+      tags: [sessions]
+      summary: 重新签发 ticket
+      description: 前端页面刷新、重连时使用。
+      operationId: reissueTicket
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: 新 ticket
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ticket:
+                    type: string
+                  ticket_expires_at:
+                    type: string
+                    format: date-time
+                  rt_base_url:
+                    type: string
+                    format: uri
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────── 6. 人设 ─────────────────────────
+  /v1/personas:
+    post:
+      tags: [personas]
+      summary: 创建人设
+      description: 可从空白或手填字段起步。
+      operationId: createPersona
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                biz_ref:
+                  type: string
+                seed:
+                  description: 初始字段（identity、style 等，Persona 的子集）
+                  $ref: '#/components/schemas/PersonaFields'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  persona_id:
+                    type: string
+                    example: ps_xxx
+                  version:
+                    type: integer
+                    example: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/personas/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PersonaId'
+    get:
+      tags: [personas]
+      summary: 结构化人设 JSON
+      operationId: getPersona
+      parameters:
+        - name: version
+          in: query
+          description: 默认最新版
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 人设
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Persona'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [personas]
+      summary: 人工修改人设
+      description: 改任意字段 → 新版本并重新编译。
+      operationId: patchPersona
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PersonaFields'
+      responses:
+        '200':
+          description: 新版本
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Persona'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [personas]
+      summary: 删除人设及素材
+      operationId: deletePersona
+      responses:
+        '204':
+          description: 已删除
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/personas/{id}/materials:
+    parameters:
+      - $ref: '#/components/parameters/PersonaId'
+    post:
+      tags: [personas]
+      summary: 上传素材
+      description: 单文件 ≤200MB，音视频 ≤60 分钟。抽取完成回调 `material.extracted` / `material.failed`。
+      operationId: addMaterial
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                url:
+                  type: string
+                  format: uri
+                  description: 与 `file` 二选一
+                kind:
+                  type: string
+                  enum: [doc, image, audio, video, url]
+                hint:
+                  type: string
+                  description: 对素材的说明，如「这是销售话术」
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  material_id:
+                    type: string
+                    example: mat_xxx
+                  job_id:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    get:
+      tags: [personas]
+      summary: 素材列表
+      description: 含各自抽取状态与摘要。
+      operationId: listMaterials
+      responses:
+        '200':
+          description: 素材
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Material'
+
+  /v1/personas/{id}/materials/{mid}:
+    delete:
+      tags: [personas]
+      summary: 删除素材
+      description: 删素材并标记人设需重新合并。
+      operationId: deleteMaterial
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+        - name: mid
+          in: path
+          required: true
+          schema:
+            type: string
+          example: mat_xxx
+      responses:
+        '204':
+          description: 已删除
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/personas/{id}/build:
+    post:
+      tags: [personas]
+      summary: 合并素材生成新版本
+      description: 合并所有素材 → 新版本，完成回调 `persona.built{version, diff_summary}`。
+      operationId: buildPersona
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+      responses:
+        '202':
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/personas/{id}/chat:
+    post:
+      tags: [personas]
+      summary: 文本试聊
+      description: 用当前编译结果做纯文本对话，不占 GPU，流式返回（SSE）。`draft` 状态即可试聊。
+      operationId: chatPersona
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+        - name: version
+          in: query
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                messages:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ChatMessage'
+      responses:
+        '200':
+          description: 流式回复
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: 每个 event 一个 `{delta}` 文本片段，结束发 `{done:true}`
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/personas/{id}/approve:
+    post:
+      tags: [personas]
+      summary: 审核通过
+      description: 标记 approved；只有 approved 版本能用于正式会话（后端可放开）。
+      operationId: approvePersona
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+        - name: version
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 编译摘要与 knowledge_mode 建议
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  persona_id:
+                    type: string
+                  version:
+                    type: integer
+                  status:
+                    type: string
+                    const: approved
+                  compiled:
+                    $ref: '#/components/schemas/PersonaCompiled'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/personas/{id}/export:
+    get:
+      tags: [personas]
+      summary: 导出人设
+      description: 导出 `compiled.system_prompt` + `knowledge` 全量，后端建 RAG 用。
+      operationId: exportPersona
+      parameters:
+        - $ref: '#/components/parameters/PersonaId'
+        - name: version
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 导出内容
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  persona_id:
+                    type: string
+                  version:
+                    type: integer
+                  system_prompt:
+                    type: string
+                  knowledge:
+                    $ref: '#/components/schemas/PersonaKnowledge'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ───────────────────────── 7. 前端实时接口 /rt ─────────────────────────
+  /rt/sessions/{id}/ice-config:
+    get:
+      tags: [rt]
+      summary: STUN/TURN 配置
+      description: 控制面统一下发**会话所在机**的 TURN 地址。
+      operationId: rtIceConfig
+      security:
+        - sessionTicket: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: ICE servers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  iceServers:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        urls:
+                          type: array
+                          items:
+                            type: string
+                        username:
+                          type: string
+                        credential:
+                          type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rt/sessions/{id}/webrtc/offer:
+    post:
+      tags: [rt]
+      summary: WebRTC offer → answer
+      description: 信令经控制面，媒体 UDP 直连 GPU 节点（或同机 coturn 中继）。
+      operationId: rtWebrtcOffer
+      security:
+        - sessionTicket: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SdpMessage'
+      responses:
+        '200':
+          description: answer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SdpMessage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rt/sessions/{id}/start:
+    post:
+      tags: [rt]
+      summary: 开始推流
+      operationId: rtStart
+      security:
+        - sessionTicket: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '204':
+          description: 已开始
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rt/sessions/{id}/events:
+    get:
+      tags: [rt]
+      summary: 会话事件（SSE）
+      description: |
+        `text/event-stream`。事件类型与 data：
+        - `session.state_changed` `{state}`（排队→created→live→ended）
+        - `speech.started` `{}`
+        - `subtitle.chunk` `{text, is_final}`
+        - `speech.ended` `{}`
+        - `asr.result` `{text}`
+        - `session.variant_changed` `{variant_id}`
+        - `session.ended` `{reason}`
+      operationId: rtEvents
+      security:
+        - sessionTicketQuery: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/TicketQuery'
+      responses:
+        '200':
+          description: SSE 流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                event: subtitle.chunk
+                data: {"text":"你好，","is_final":false}
+
+                event: session.ended
+                data: {"reason":"hangup"}
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rt/sessions/{id}/asr:
+    get:
+      tags: [rt]
+      summary: 语音输入（WebSocket）
+      description: |
+        **WebSocket**，`?ticket=` 鉴权，沿用现有协议：
+        1. 先发文本帧 `{"type":"meta"}`；
+        2. 再发二进制帧：16kHz s16le 单声道 PCM；
+        3. 最后发 `{"type":"end"}`；
+        4. 服务端回 `{"text": "..."}` 或 `{"error": "..."}`。
+      operationId: rtAsrWs
+      security:
+        - sessionTicketQuery: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/TicketQuery'
+      x-protocol: websocket
+      responses:
+        '101':
+          description: 升级为 WebSocket
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rt/sessions/{id}/interrupt:
+    post:
+      tags: [rt]
+      summary: 打断
+      description: 用户开口即打断。
+      operationId: rtInterrupt
+      security:
+        - sessionTicket: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '204':
+          description: 已打断
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /rt/sessions/{id}/text:
+    post:
+      tags: [rt]
+      summary: 打字输入
+      description: 等价于 `speak(mode=chat)`。
+      operationId: rtText
+      security:
+        - sessionTicket: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+      responses:
+        '202':
+          description: 已接受
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ───────────────────────── 8. 内部接口 /internal ─────────────────────────
+  /internal/nodes/heartbeat:
+    post:
+      tags: [internal]
+      summary: 节点心跳（节点 → 控制面）
+      description: 每 5 秒一次；会话开始/结束时立即补一条增量。控制面 15 秒没收到判下线。心跳只发 VIP。携带会话完整元数据，备控制面接管后据此 15 秒内重建路由表；控制面比对 `assets_hash` 后主动补推/补删素材。
+      operationId: internalHeartbeat
+      servers:
+        - url: https://{vip}:8443
+          variables:
+            vip:
+              default: <CONTROL_VIP>
+      security:
+        - nodeToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Heartbeat'
+      responses:
+        '200':
+          description: 已接收
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  primary:
+                    type: boolean
+                    description: 控制面是否持有 VIP
+                  sync:
+                    type: object
+                    description: 需要节点补拉/删除的素材差异
+                    properties:
+                      avatars_missing:
+                        type: array
+                        items:
+                          type: string
+                      voices_missing:
+                        type: array
+                        items:
+                          type: string
+                      remove:
+                        type: array
+                        items:
+                          type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /internal/events:
+    post:
+      tags: [internal]
+      summary: 上报事件（节点 → 控制面）
+      description: 对话轮次、会话结束 + 用量等。节点本地磁盘 spool，失败重试；控制面落盘后再回调后端，`event_id` 幂等。`session.ended` 的用量由节点算。
+      operationId: internalEvents
+      servers:
+        - url: https://{vip}:8443
+          variables:
+            vip:
+              default: <CONTROL_VIP>
+      security:
+        - nodeToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CallbackEvent'
+      responses:
+        '200':
+          description: 已落盘
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted:
+                    type: array
+                    items:
+                      type: string
+                    description: 已接收的 event_id
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /internal/avatars/{id}/sync:
+    post:
+      tags: [internal]
+      summary: 同步形象（控制面 → 节点）
+      description: 新形象/变体建好后通知节点从控制面拉取到本地并预热。
+      operationId: internalAvatarSync
+      security:
+        - nodeToken: []
+      parameters:
+        - $ref: '#/components/parameters/AvatarId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                source_url:
+                  type: string
+                  format: uri
+                variant_ids:
+                  type: array
+                  items:
+                    type: string
+                prewarm:
+                  type: boolean
+                  default: true
+      responses:
+        '202':
+          description: 节点开始拉取
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /internal/voices/sync:
+    post:
+      tags: [internal]
+      summary: 同步音色（控制面 → 合成节点）
+      description: 新音色登记后通知合成节点拉取参考 wav；合成节点首次遇到未知音色时也可自行向控制面拉取。
+      operationId: internalVoiceSync
+      security:
+        - nodeToken: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                voice_ids:
+                  type: array
+                  items:
+                    type: string
+                remove:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '202':
+          description: 节点开始拉取
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /internal/drain:
+    post:
+      tags: [internal]
+      summary: 节点排空（控制面 → 节点）
+      description: 发版或借卡跑 H3 时不再接新会话，等现有通话结束。可指定实例。
+      operationId: internalDrain
+      security:
+        - nodeToken: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                instances:
+                  type: array
+                  items:
+                    type: string
+                  description: 不传 = 整个节点
+                undrain:
+                  type: boolean
+                  default: false
+                  description: 恢复接流量
+      responses:
+        '200':
+          description: 当前 draining 状态
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  draining:
+                    type: array
+                    items:
+                      type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /internal/h3/run:
+    post:
+      tags: [internal]
+      summary: 派发 H3 生成任务（控制面 → 节点 talk-h3）
+      description: 只在借到卡时派发；流式回进度（SSE）。每条 ≤3 分钟，高峰时做完当前片段即停。
+      operationId: internalH3Run
+      security:
+        - nodeToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [job_id, gpu, avatar_id, variant_id, kind, prompt]
+              properties:
+                job_id:
+                  type: string
+                gpu:
+                  type: integer
+                  description: 借到的卡号
+                avatar_id:
+                  type: string
+                variant_id:
+                  type: string
+                kind:
+                  $ref: '#/components/schemas/VariantKind'
+                prompt:
+                  type: string
+                reference_image_url:
+                  type: string
+                  format: uri
+                duration_s:
+                  type: number
+                  default: 6
+                seed:
+                  type: integer
+      responses:
+        '200':
+          description: 进度流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: '`progress {step, progress}` … 结束 `done {output_url, seam_ratio}` 或 `failed {error}`'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: 该卡未 drain 完成或已有任务
+
+# ───────────────────────── 回调（AI → 后端 callback_url） ─────────────────────────
+webhooks:
+  avatar.ready:
+    post:
+      tags: [avatars]
+      summary: 形象就绪
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: avatar.ready
+                    data:
+                      type: object
+                      properties:
+                        avatar_id:
+                          type: string
+                        preview_url:
+                          type: string
+      responses:
+        '200':
+          description: 后端已接收
+  avatar.failed:
+    post:
+      tags: [avatars]
+      summary: 形象失败（含人脸检测失败、控制面重启任务丢失）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: avatar.failed
+                    data:
+                      type: object
+                      properties:
+                        avatar_id:
+                          type: string
+                        error:
+                          type: string
+      responses:
+        '200':
+          description: 后端已接收
+  voice.ready:
+    post:
+      tags: [voices]
+      summary: 音色就绪
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: voice.ready
+                    data:
+                      type: object
+                      properties:
+                        voice_id:
+                          type: string
+      responses:
+        '200':
+          description: 后端已接收
+  variant.ready:
+    post:
+      tags: [variants]
+      summary: 变体就绪（已推送到所有节点并预热）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: variant.ready
+                    data:
+                      type: object
+                      properties:
+                        variant_id:
+                          type: string
+                        avatar_id:
+                          type: string
+                        preview_url:
+                          type: string
+      responses:
+        '200':
+          description: 后端已接收
+  variant.failed:
+    post:
+      tags: [variants]
+      summary: 变体失败
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: variant.failed
+                    data:
+                      type: object
+                      properties:
+                        variant_id:
+                          type: string
+                        error:
+                          type: string
+      responses:
+        '200':
+          description: 后端已接收
+  session.started:
+    post:
+      tags: [sessions]
+      summary: 会话开始（前端推流成功）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: session.started
+                    data:
+                      type: object
+                      properties:
+                        session_id:
+                          type: string
+                        started_at:
+                          type: string
+                          format: date-time
+      responses:
+        '200':
+          description: 后端已接收
+  conversation.turn:
+    post:
+      tags: [sessions]
+      summary: 对话轮次（后端以此存聊天记录，对话记录真源在后端）
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: conversation.turn
+                    data:
+                      type: object
+                      properties:
+                        session_id:
+                          type: string
+                        user_text:
+                          type: string
+                        bot_text:
+                          type: string
+                        ts:
+                          type: string
+                          format: date-time
+      responses:
+        '200':
+          description: 后端已接收
+  session.ended:
+    post:
+      tags: [sessions]
+      summary: 会话结束（含用量，计费以此为准）
+      description: '`reason=node_failure` 时后端应带 `history` 重新 `POST /v1/sessions`，前端用新 ticket 重连。开启 `record` 时带录制文件 URL。'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: session.ended
+                    data:
+                      type: object
+                      properties:
+                        session_id:
+                          type: string
+                        reason:
+                          $ref: '#/components/schemas/EndedReason'
+                        usage:
+                          $ref: '#/components/schemas/Usage'
+                        recording_url:
+                          type: string
+                          format: uri
+      responses:
+        '200':
+          description: 后端已接收
+  material.extracted:
+    post:
+      tags: [personas]
+      summary: 素材抽取完成
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: material.extracted
+                    data:
+                      type: object
+                      properties:
+                        persona_id:
+                          type: string
+                        material_id:
+                          type: string
+                        summary:
+                          type: string
+      responses:
+        '200':
+          description: 后端已接收
+  material.failed:
+    post:
+      tags: [personas]
+      summary: 素材抽取失败
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: material.failed
+                    data:
+                      type: object
+                      properties:
+                        persona_id:
+                          type: string
+                        material_id:
+                          type: string
+                        error:
+                          type: string
+      responses:
+        '200':
+          description: 后端已接收
+  persona.built:
+    post:
+      tags: [personas]
+      summary: 人设新版本构建完成
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CallbackEnvelope'
+                - type: object
+                  properties:
+                    type:
+                      const: persona.built
+                    data:
+                      type: object
+                      properties:
+                        persona_id:
+                          type: string
+                        version:
+                          type: integer
+                        diff_summary:
+                          type: string
+                        knowledge_mode:
+                          $ref: '#/components/schemas/KnowledgeMode'
+      responses:
+        '200':
+          description: 后端已接收
+
+components:
+  securitySchemes:
+    serviceKey:
+      type: http
+      scheme: bearer
+      description: 服务密钥（后端 → 控制面），支持双密钥轮换
+    sessionTicket:
+      type: apiKey
+      in: header
+      name: X-Session-Ticket
+      description: 会话 ticket（HMAC 签名无状态令牌，绑定单会话、短时有效）
+    sessionTicketQuery:
+      type: apiKey
+      in: query
+      name: ticket
+      description: SSE / WebSocket 用 query 传 ticket
+    nodeToken:
+      type: apiKey
+      in: header
+      name: X-Node-Token
+      description: 内网节点令牌
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+      description: 幂等键；主备切换时后端重试不会重复创建
+    AvatarId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: av_xxx
+    VariantId:
+      name: vid
+      in: path
+      required: true
+      schema:
+        type: string
+      example: var_xxx
+    VoiceId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: vc_xxx
+    SessionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: sess_xxx
+    PersonaId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      example: ps_xxx
+    TicketQuery:
+      name: ticket
+      in: query
+      required: true
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: 参数错误
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: 鉴权失败 / ticket 过期
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: 不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Standby:
+      description: 备控制面未持有 VIP，拒绝受理
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error:
+              code: standby
+              message: not primary
+              retry_after: 3
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              examples: [capacity_full, standby, invalid_ticket, not_found, bad_request]
+            message:
+              type: string
+            retry_after:
+              type: integer
+              description: 秒
+
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        role:
+          type: string
+          enum: [primary, standby]
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              ok:
+                type: boolean
+              draining:
+                type: boolean
+              instances_ok:
+                type: integer
+              instances:
+                type: array
+                description: 每个实例的实时负载
+                items:
+                  $ref: '#/components/schemas/InstanceLoad'
+
+    Capacity:
+      type: object
+      properties:
+        online:
+          type: integer
+          description: 当前在线会话数
+        max_online:
+          type: integer
+        talking:
+          type: integer
+          description: 当前说话路数
+        available:
+          type: integer
+          description: 还能建多少会话
+
+    InstanceLoad:
+      type: object
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+        cap:
+          type: integer
+          description: 节点按显卡上报的在线上限（3090=6，4090≈9）
+        sessions:
+          type: array
+          items:
+            type: string
+          description: 该实例上的 session_id
+        talking:
+          type: integer
+        warm_avatars:
+          type: array
+          items:
+            type: string
+          description: 已预热的 avatar / variant id
+        draining:
+          type: boolean
+
+    Avatar:
+      type: object
+      properties:
+        id:
+          type: string
+          example: av_xxx
+        name:
+          type: string
+        status:
+          type: string
+          enum: [processing, ready, failed]
+        animated:
+          type: boolean
+          description: 是否有动态底板
+        builtin:
+          type: boolean
+        preview_url:
+          type: string
+          format: uri
+        default_variant_id:
+          type: string
+        biz_ref:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    VariantKind:
+      type: string
+      enum: [background, outfit, pose, idle]
+
+    OfflinePriority:
+      type: string
+      enum: [idle, normal, urgent]
+      description: idle 只在闲时跑；normal 低峰即跑；urgent 走云端 API
+
+    VariantCreate:
+      type: object
+      required: [kind, prompt]
+      properties:
+        kind:
+          $ref: '#/components/schemas/VariantKind'
+        prompt:
+          type: string
+        reference_image:
+          type: string
+          format: uri
+          description: 参考图 URL（multipart 时可直接上传文件）
+        duration_s:
+          type: number
+          default: 6
+        seed:
+          type: integer
+        priority:
+          $ref: '#/components/schemas/OfflinePriority'
+        callback_url:
+          type: string
+          format: uri
+        biz_ref:
+          type: string
+
+    Variant:
+      type: object
+      properties:
+        variant_id:
+          type: string
+          example: var_xxx
+        avatar_id:
+          type: string
+        kind:
+          $ref: '#/components/schemas/VariantKind'
+        prompt:
+          type: string
+        status:
+          type: string
+          enum: [queued, generating, checking, distributing, ready, failed]
+        preview_url:
+          type: string
+          format: uri
+          description: 预览视频
+        seed:
+          type: integer
+        error:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    OfflineQueue:
+      type: object
+      properties:
+        pending:
+          type: integer
+        running:
+          type: array
+          items:
+            type: object
+            properties:
+              job:
+                type: string
+              node:
+                type: string
+              gpu:
+                type: integer
+              progress:
+                type: number
+                minimum: 0
+                maximum: 1
+        borrowed_gpus:
+          type: array
+          items:
+            type: object
+            properties:
+              node:
+                type: string
+              gpu:
+                type: integer
+        policy:
+          $ref: '#/components/schemas/OfflinePolicy'
+
+    OfflinePolicy:
+      type: object
+      description: 三档借卡策略
+      properties:
+        night_window:
+          type: object
+          properties:
+            start:
+              type: string
+              example: '00:00'
+            end:
+              type: string
+              example: '07:00'
+        night_online_ratio:
+          type: number
+          description: 在线低于此比例视为夜间档
+          example: 0.2
+        night_gpus_per_node:
+          type: integer
+          example: 2
+        lowpeak_online_ratio:
+          type: number
+          example: 0.5
+        lowpeak_sustain_s:
+          type: integer
+          description: 低峰需持续多久才借卡
+          example: 600
+        lowpeak_gpus_per_node:
+          type: integer
+          example: 1
+        peak_online_ratio:
+          type: number
+          description: 达到即归还卡
+          example: 0.5
+        max_concurrent_per_biz_ref:
+          type: integer
+          example: 2
+
+    Voice:
+      type: object
+      properties:
+        id:
+          type: string
+          example: vc_xxx
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [preset, clone]
+        status:
+          type: string
+          enum: [processing, ready, failed]
+        ref_text:
+          type: string
+        dialects:
+          type: array
+          items:
+            type: string
+        biz_ref:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    Job:
+      type: object
+      properties:
+        id:
+          type: string
+          example: job_xxx
+        status:
+          type: string
+          enum: [queued, running, done, failed]
+        kind:
+          type: string
+          enum: [avatar, variant, material, persona_build]
+        needs_gpu:
+          type: boolean
+        step:
+          type: string
+        progress:
+          type: number
+          minimum: 0
+          maximum: 1
+        result:
+          type: object
+          additionalProperties: true
+        error:
+          type: string
+        biz_ref:
+          type: string
+
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant, system]
+        content:
+          type: string
+
+    LlmConfig:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [builtin, external, none]
+          default: builtin
+          description: |
+            - builtin：AI 侧用内置 LLM（豆包/MiniMax）+ system_prompt 回复
+            - external：AI 侧调后端提供的 OpenAI 兼容地址，后端可加知识库、审核、存历史
+            - none：不走 LLM，只按 speak(mode=say) 下发的文本念
+        provider:
+          type: string
+          description: builtin 时选 provider
+          examples: [ark, minimax]
+        url:
+          type: string
+          format: uri
+          description: external 时的 OpenAI 兼容地址
+        api_key:
+          type: string
+          description: external 时的密钥
+        model:
+          type: string
+
+    PersonaRef:
+      type: object
+      description: 用 persona_id 引用人设，或直接手写 system_prompt，二者可叠加（extra_prompt 追加场景指令）
+      properties:
+        persona_id:
+          type: string
+          example: ps_xxx
+        version:
+          type: integer
+          description: 不传 = 最新 approved 版本
+        system_prompt:
+          type: string
+        extra_prompt:
+          type: string
+
+    SessionCreate:
+      type: object
+      required: [avatar_id, voice_id]
+      properties:
+        avatar_id:
+          type: string
+        variant_id:
+          type: string
+          description: 不传 = 形象默认底板
+        voice_id:
+          type: string
+        dialect:
+          type: string
+          example: 四川话
+        persona:
+          $ref: '#/components/schemas/PersonaRef'
+        llm:
+          $ref: '#/components/schemas/LlmConfig'
+        history:
+          type: array
+          description: 断线重连 / 切节点时由后端带回最近几轮
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        idle_timeout_s:
+          type: integer
+          default: 120
+          description: 由节点本地定时器执行
+        max_duration_s:
+          type: integer
+          default: 1800
+        queue:
+          type: boolean
+          default: false
+          description: 满员时是否排队（返回 202）
+        priority:
+          type: string
+          enum: [normal, high]
+          default: normal
+          description: 每节点预留 1 个说话槽给 high
+        record:
+          type: boolean
+          default: false
+          description: 节点本地录混合音频 + 字幕，结束后上传并在 session.ended 给 URL
+        biz_ref:
+          type: string
+          example: order_123
+        callback_url:
+          type: string
+          format: uri
+          example: https://backend/ai/callback
+      example:
+        avatar_id: av_xxx
+        voice_id: vc_xxx
+        dialect: 四川话
+        persona:
+          persona_id: ps_xxx
+          extra_prompt: 现在是直播带货场景
+        llm:
+          mode: builtin
+          provider: ark
+        history:
+          - role: user
+            content: 你好
+          - role: assistant
+            content: 你好，有什么可以帮你？
+        idle_timeout_s: 120
+        max_duration_s: 1800
+        queue: false
+        biz_ref: order_123
+        callback_url: https://backend/ai/callback
+
+    SessionCreated:
+      type: object
+      required: [session_id, ticket, rt_base_url]
+      properties:
+        session_id:
+          type: string
+          example: sess_xxx
+        ticket:
+          type: string
+        ticket_expires_at:
+          type: string
+          format: date-time
+        rt_base_url:
+          type: string
+          format: uri
+          example: https://<CONTROL_VIP>:8443/rt
+        expires_at:
+          type: string
+          format: date-time
+          description: 会话未开始时的过期时间（idle_timeout 兜底）
+
+    Session:
+      type: object
+      properties:
+        session_id:
+          type: string
+        state:
+          type: string
+          enum: [queued, created, live, ended, failed]
+        speaking:
+          type: boolean
+        avatar_id:
+          type: string
+        variant_id:
+          type: string
+        voice_id:
+          type: string
+        dialect:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        ended_reason:
+          $ref: '#/components/schemas/EndedReason'
+        position:
+          type: integer
+          description: 排队位置（queued 时）
+        biz_ref:
+          type: string
+
+    EndedReason:
+      type: string
+      enum: [hangup, idle_timeout, max_duration, node_failure, error]
+
+    Usage:
+      type: object
+      properties:
+        duration_s:
+          type: number
+          description: 会话总时长
+        talk_s:
+          type: number
+          description: 数字人说话时长
+        tts_chars:
+          type: integer
+        llm_tokens:
+          type: integer
+
+    SdpMessage:
+      type: object
+      required: [sdp, type]
+      properties:
+        sdp:
+          type: string
+        type:
+          type: string
+          enum: [offer, answer]
+
+    KnowledgeMode:
+      type: string
+      enum: [inline, external]
+      description: 编译后 prompt ≤3k tokens 直接内联；超过则知识走 external，由后端做 RAG
+
+    PersonaKnowledge:
+      type: object
+      properties:
+        facts:
+          type: array
+          items:
+            type: string
+        faq:
+          type: array
+          items:
+            type: object
+            properties:
+              q:
+                type: string
+              a:
+                type: string
+        products:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              points:
+                type: array
+                items:
+                  type: string
+        sources:
+          type: array
+          items:
+            type: string
+          description: material_id 列表
+
+    PersonaCompiled:
+      type: object
+      properties:
+        system_prompt:
+          type: string
+        prompt_tokens:
+          type: integer
+        knowledge_mode:
+          $ref: '#/components/schemas/KnowledgeMode'
+
+    PersonaFields:
+      type: object
+      description: 结构化人设可编辑字段（v1）
+      properties:
+        identity:
+          type: object
+          properties:
+            name:
+              type: string
+            role:
+              type: string
+            org:
+              type: string
+            intro:
+              type: string
+              description: 一句话自我介绍
+        background:
+          type: array
+          items:
+            type: string
+          description: 学历/经历/成就要点
+        style:
+          type: object
+          properties:
+            tone:
+              type: string
+              examples: [亲切, 专业, 幽默]
+            pace:
+              type: string
+            catchphrases:
+              type: array
+              items:
+                type: string
+            address_user:
+              type: string
+              examples: [您, 你, 同学]
+            dialect_hint:
+              type: string
+            examples:
+              type: array
+              items:
+                type: object
+                properties:
+                  user:
+                    type: string
+                  bot:
+                    type: string
+        knowledge:
+          $ref: '#/components/schemas/PersonaKnowledge'
+        boundaries:
+          type: object
+          properties:
+            forbidden:
+              type: array
+              items:
+                type: string
+            fallback:
+              type: string
+              description: 超出范围时怎么说
+            handoff:
+              type: string
+              description: 转人工话术
+        recommend:
+          type: object
+          properties:
+            voice_id:
+              type: string
+            avatar_hint:
+              type: string
+            opening:
+              type: string
+              description: 开场白
+
+    Persona:
+      allOf:
+        - type: object
+          properties:
+            persona_id:
+              type: string
+              example: ps_xxx
+            name:
+              type: string
+            version:
+              type: integer
+            status:
+              type: string
+              enum: [draft, approved]
+            needs_rebuild:
+              type: boolean
+              description: 删素材后标记，需重新 build
+            biz_ref:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+        - $ref: '#/components/schemas/PersonaFields'
+        - type: object
+          properties:
+            compiled:
+              $ref: '#/components/schemas/PersonaCompiled'
+
+    Material:
+      type: object
+      properties:
+        material_id:
+          type: string
+          example: mat_xxx
+        kind:
+          type: string
+          enum: [doc, image, audio, video, url]
+        name:
+          type: string
+        hint:
+          type: string
+        status:
+          type: string
+          enum: [queued, extracting, done, failed]
+        summary:
+          type: string
+        error:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    Heartbeat:
+      type: object
+      required: [node_id, role, base_url]
+      properties:
+        node_id:
+          type: string
+        role:
+          type: string
+          enum: [render, tts]
+        base_url:
+          type: string
+          description: 节点网关内网地址
+        public_ip:
+          type: string
+          description: 浏览器可达的 IP（WebRTC）
+        gpu_model:
+          type: string
+          examples: [RTX 3090, TITAN V, RTX 4090]
+        draining:
+          type: boolean
+        instances:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/InstanceLoad'
+              - type: object
+                properties:
+                  session_meta:
+                    type: array
+                    description: 会话完整元数据，供备控制面接管后重建路由
+                    items:
+                      type: object
+                      properties:
+                        session_id:
+                          type: string
+                        biz_ref:
+                          type: string
+                        callback_url:
+                          type: string
+                        llm:
+                          $ref: '#/components/schemas/LlmConfig'
+                        state:
+                          type: string
+        tts:
+          type: object
+          properties:
+            inflight:
+              type: integer
+            max:
+              type: integer
+        assets_hash:
+          type: string
+          description: 本地素材清单哈希，控制面比对差异后补推/补删
+        metrics:
+          type: object
+          description: 自适应 cap 用
+          properties:
+            gpu_util:
+              type: number
+            frame_drop_rate:
+              type: number
+
+    CallbackEnvelope:
+      type: object
+      required: [event_id, type, ts]
+      properties:
+        event_id:
+          type: string
+          description: 后端按它去重
+        type:
+          type: string
+        ts:
+          type: string
+          format: date-time
+        biz_ref:
+          type: string
+        data:
+          type: object
+
+    CallbackEvent:
+      allOf:
+        - $ref: '#/components/schemas/CallbackEnvelope'
+        - type: object
+          properties:
+            session_id:
+              type: string
+            callback_url:
+              type: string
+              format: uri
+              description: 节点带上，控制面据此转发

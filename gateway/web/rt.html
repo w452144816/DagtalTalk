@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<title>全身实时通话</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  /* 全身实时通话页：首页选形象/照片、背景、服装（自动配人设和音色）→ 全屏通话（视频 + 字幕 + 打断/挂断） */
+  .vd-call { position: fixed; inset: 0; background: #000; display: flex; flex-direction: column; z-index: 50; }
+  .vd-call[hidden] { display: none; }
+  .vd-stage { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+  .vd-stage video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .vd-wait[hidden] { display: none !important; }
+  .vd-wait { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 10px; color: #fff; font-size: 15px; text-align: center; padding: 24px; }
+  .vd-wait img { width: 140px; height: 140px; object-fit: cover; border-radius: 50%; opacity: .85; }
+  .vd-top { position: absolute; top: max(12px, env(safe-area-inset-top)); left: 12px; right: 12px; display: flex;
+    justify-content: space-between; color: #fff; font-size: 13px; text-shadow: 0 1px 3px rgba(0,0,0,.6); pointer-events: none; }
+  .vd-subs { position: absolute; left: 12px; right: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 6px;
+    pointer-events: none; }
+  .vd-subs p { margin: 0; align-self: flex-start; max-width: 88%; background: rgba(0,0,0,.55); color: #fff;
+    padding: 6px 10px; border-radius: 10px; font-size: 15px; line-height: 1.45; }
+  .vd-subs p.me { align-self: flex-end; background: rgba(0,122,255,.75); }
+  .vd-bar { display: flex; justify-content: center; gap: 28px; padding: 16px 16px max(18px, env(safe-area-inset-bottom));
+    background: #000; }
+  .vd-btn { width: 64px; height: 64px; border-radius: 50%; border: 0; font-size: 13px; color: #fff; cursor: pointer;
+    background: rgba(255,255,255,.18); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+  .vd-btn b { font-size: 22px; line-height: 1; }
+  .vd-btn.red { background: var(--red); }
+  .vd-btn.off { background: rgba(255,255,255,.45); color: #000; }
+  .vd-text { display: flex; gap: 8px; padding: 0 16px 10px; background: #000; }
+  .vd-text input { flex: 1; min-width: 0; font: inherit; font-size: 15px; padding: 9px 12px; border-radius: 18px; border: 0;
+    background: rgba(255,255,255,.14); color: #fff; outline: none; }
+  .vd-text button { border: 0; border-radius: 18px; padding: 0 14px; background: var(--tint); color: #fff; font: inherit; font-size: 15px; }
+  .vd-photo { display: flex; gap: 12px; align-items: center; }
+  .vd-photo img { width: 64px; height: 64px; border-radius: 10px; object-fit: cover; }
+  .vd-prof { font-size: 14px; color: var(--sub); }
+  .vd-prof b { color: var(--text); font-weight: 600; }
+  .vd-presets { display: flex; gap: 10px; overflow-x: auto; padding: 4px 2px 8px; scrollbar-width: none; }
+  .vd-presets::-webkit-scrollbar { display: none; }
+  .vd-presets button { flex: 0 0 auto; width: 84px; border: 2px solid transparent; border-radius: 12px; padding: 0;
+    background: var(--card); overflow: hidden; cursor: pointer; color: var(--text); font: inherit; font-size: 12px; }
+  .vd-presets button.on { border-color: var(--tint); }
+  .vd-presets img, .vd-presets .none { width: 100%; height: 100px; object-fit: cover; display: flex; align-items: center;
+    justify-content: center; background: var(--bg); color: var(--sub); font-size: 13px; }
+  .vd-presets.outfit img { object-fit: contain; background: #fff; }
+  .vd-presets span { display: block; padding: 4px 2px 6px; text-align: center; }
+</style>
+</head>
+<body>
+<main id="home" class="page">
+  <header class="large-title">
+    <h1>全身实时通话</h1>
+    <p class="sub">整个人实时生成：头、表情、身体一起动；可以选背景和服装。按通话时长计费（1.5 点/秒）。</p>
+  </header>
+
+  <section class="group">
+    <div class="group-title">选一个形象</div>
+    <div id="avatars" class="avatar-grid"></div>
+    <label class="btn btn-tinted upload-btn">
+      <input id="photo" type="file" accept="image/*" hidden>
+      <span>＋ 用一张新照片</span>
+    </label>
+    <div id="photoRow" class="cell vd-photo" hidden>
+      <img id="photoPreview" alt="">
+      <span class="hint">用这张照片通话（不保存为形象）</span>
+      <button id="photoClear" class="icon-btn" aria-label="不用这张">✕</button>
+    </div>
+    <p class="hint">单人、正脸、无遮挡的照片效果最好；半身或全身照也可以，身体会一起动。</p>
+  </section>
+
+  <section class="group">
+    <div class="group-title">背景</div>
+    <div id="bgs" class="vd-presets"></div>
+    <div class="group-title" style="margin-top:12px">服装</div>
+    <div id="outfits" class="vd-presets outfit"></div>
+    <div id="composeRow" class="cell vd-photo" hidden>
+      <img id="composePreview" alt="">
+      <span id="composeText" class="hint"></span>
+      <button id="composeAgain" class="icon-btn" type="button" aria-label="换一张">↻</button>
+    </div>
+    <p class="hint">选好后先生成一张换好装的照片（约半分钟），通话就用这张，过程中画面不会再变。</p>
+  </section>
+
+  <section class="group">
+    <div class="group-title">人设和音色 <small id="profSrc"></small></div>
+    <div class="cell vd-prof" id="profLine">选好形象后自动配上</div>
+    <label class="cell">
+      <span>音色</span>
+      <select id="voice"></select>
+    </label>
+    <details class="cell cell-col">
+      <summary>人设 <small class="hint">自动生成，可以改</small></summary>
+      <textarea id="persona" rows="6" placeholder="正在根据照片生成人设…"></textarea>
+    </details>
+  </section>
+
+  <section class="group">
+    <button id="start" class="btn btn-filled" style="width:100%">开始通话</button>
+    <p id="status" class="hint center"></p>
+    <p class="hint center"><a href="/">← 回到原来的通话方式</a></p>
+  </section>
+</main>
+
+<section id="call" class="vd-call" hidden>
+  <div class="vd-stage">
+    <video id="remote" autoplay playsinline></video>
+    <div id="wait" class="vd-wait"><img id="waitImg" alt=""><span id="waitText">正在连接…</span></div>
+    <div class="vd-top"><span id="callState">连接中</span><span id="timer">00:00</span></div>
+    <div id="subs" class="vd-subs"></div>
+  </div>
+  <div class="vd-bar">
+    <button id="mute" class="vd-btn" type="button"><b>🎤</b>静音</button>
+    <button id="interrupt" class="vd-btn" type="button"><b>✋</b>打断</button>
+    <button id="hang" class="vd-btn red" type="button"><b>✕</b>挂断</button>
+  </div>
+</section>
+
+<script src="https://g.alicdn.com/apsara-media-box/imp-web-rtc/7.1.9/aliyun-rtc-sdk.js"></script>
+<script src="/static/rt.js"></script>
+</body>
+</html>

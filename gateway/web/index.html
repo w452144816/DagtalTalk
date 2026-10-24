@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<title>数字人通话</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<!-- 首页：选形象 / 上传照片 -->
+<main id="home" class="page">
+  <header class="large-title">
+    <h1>数字人通话</h1>
+    <p class="sub">上传一张正脸照片，和 TA 实时视频聊天</p>
+  </header>
+
+  <section class="group">
+    <div class="group-title">形象</div>
+    <div id="avatars" class="avatar-grid"></div>
+    <label class="btn btn-tinted upload-btn">
+      <input id="photo" type="file" accept="image/*" hidden>
+      <span id="uploadLabel">＋ 上传照片创建形象</span>
+    </label>
+    <label class="cell" id="animateRow">
+      <span>动态形象<small class="hint">眨眼、点头、手势，多等约 1 分钟</small></span>
+      <input id="animate" type="checkbox" class="switch" checked>
+    </label>
+    <label class="cell" id="renderRow" hidden>
+      <span>渲染模型<small class="hint">口型：只换嘴，最稳；整脸：表情和头部跟着语音动；整头：整个头由模型生成</small></span>
+      <select id="renderModel"></select>
+    </label>
+    <label class="cell" id="clipsRow">
+      <span>底板段数<small class="hint">每段 6 秒、动作不同，段越多循环越不重复（每段一次视频额度）</small></span>
+      <select id="clips"><option value="1">1 段</option><option value="3" selected>3 段</option><option value="5">5 段</option></select>
+    </label>
+    <p class="hint">正脸、光线均匀、背景简单效果最好；想让手也动，照片里要拍到手（半身照）。</p>
+  </section>
+
+  <section class="group">
+    <div class="group-title">设置</div>
+    <div class="cell">
+      <span>对话模型</span>
+      <div id="providers" class="segmented"></div>
+    </div>
+    <div class="cell">
+      <span>音色</span>
+      <div class="voice-pick">
+        <select id="voice"></select>
+        <button id="voicePlay" class="icon-btn" aria-label="试听">▶</button>
+        <button id="voiceDel" class="icon-btn danger" aria-label="删除克隆音色" hidden>🗑</button>
+      </div>
+    </div>
+    <div id="dialectCell" class="cell" hidden>
+      <span>方言</span>
+      <select id="dialect"></select>
+    </div>
+    <button id="cloneOpen" class="cell cell-btn" hidden>＋ 克隆我的声音</button>
+  </section>
+
+  <section class="group">
+    <a class="cell cell-btn" href="/rt">全身实时通话（新）<small class="hint">整个人实时生成，头和身体一起动，能换衣服、换背景</small></a>
+  </section>
+
+  <section class="group">
+    <div class="group-title">人设<span id="personaHint" class="group-note"></span></div>
+    <div class="persona-wrap">
+      <button class="row-arrow left" data-dir="-1" aria-label="向左">‹</button>
+      <div id="personas" class="persona-row"></div>
+      <button class="row-arrow right" data-dir="1" aria-label="向右">›</button>
+    </div>
+    <label class="cell" id="psCell" hidden><span>结构化人设<small id="psNote" class="group-note"></small></span>
+      <select id="psSelect"><option value="">不用（用上面的模板）</option></select></label>
+    <button id="psOpen" class="cell cell-btn">＋ 用素材创建人设</button>
+    <label class="cell" id="memRow">
+      <span>记住聊过的事<small class="hint">按"你 × 这个形象"记，下次聊天接得上</small></span>
+      <input id="memOn" type="checkbox" class="switch" checked>
+    </label>
+    <details class="cell cell-col" id="memCell">
+      <summary>她记得什么 <small id="memCount" class="hint"></small></summary>
+      <ul id="memList" class="mem-list"></ul>
+      <button id="memClear" type="button" class="cell-btn danger-text">清除这个形象对我的记忆</button>
+    </details>
+    <details class="cell cell-col prompt-cell">
+      <summary>查看 / 修改提示词</summary>
+      <textarea id="prompt" rows="6"></textarea>
+    </details>
+  </section>
+
+  <button id="callBtn" class="btn btn-filled big" disabled>开始视频通话</button>
+  <p id="status" class="hint center"></p>
+</main>
+
+<!-- 通话页 -->
+<main id="call" class="page call" hidden>
+  <video id="video" playsinline autoplay></video>
+  <img id="poster" alt="">
+  <div class="call-top">
+    <span id="callName"></span>
+    <span class="call-top-right">
+      <button id="subsBtn" class="pill pill-btn" type="button" aria-pressed="true" title="显示 / 隐藏字幕">字幕 开</button>
+      <span id="callState" class="pill">连接中…</span>
+    </span>
+  </div>
+  <div id="subs" class="subs"></div>
+  <div class="call-bottom">
+    <div id="meter" class="meter"><i></i></div>
+    <form id="textForm" class="text-form">
+      <input id="textInput" placeholder="也可以打字…" autocomplete="off" enterkeyhint="send">
+    </form>
+    <div class="call-buttons">
+      <button id="micBtn" class="round mic" aria-label="麦克风">🎙️</button>
+      <button id="hangBtn" class="round hang" aria-label="挂断">✕</button>
+    </div>
+    <p id="micHint" class="hint center light">点麦克风开始说话，说完停顿一下自动发送；数字人说话时开口可打断</p>
+  </div>
+</main>
+
+<!-- 克隆音色 -->
+<dialog id="cloneSheet" class="sheet">
+  <form method="dialog" class="sheet-head">
+    <button class="link" value="cancel">取消</button>
+    <b>克隆声音</b>
+    <span></span>
+  </form>
+  <p class="hint">用正常说话的语气，把下面这段话读出来（10~20 秒，安静环境效果最好；也可以上传任意一段清晰的说话录音）：</p>
+  <blockquote id="cloneText">今天天气不错，我刚刚散步回来，路上看到很多人在公园里跑步、遛狗，还有小朋友在放风筝。
+    要是你也有空的话，我们找个时间一起出去走走吧，顺便聊聊最近发生的那些有意思的事情。</blockquote>
+  <button id="recBtn" class="btn btn-filled">● 开始录音</button>
+  <audio id="recAudio" controls hidden></audio>
+  <label class="btn btn-tinted">
+    <input id="cloneFile" type="file" accept="audio/*,video/*" hidden>
+    或者上传一段录音 / 视频
+  </label>
+  <input id="cloneName" class="field" placeholder="给这个声音起个名字" maxlength="16">
+  <button id="cloneSubmit" class="btn btn-filled" disabled>生成音色</button>
+  <p class="hint">在本服务器上用本地模型生成，录音不上传第三方；请只克隆你本人或已获授权的声音。</p>
+</dialog>
+
+<dialog id="psSheet" class="sheet">
+  <form method="dialog" class="sheet-head">
+    <button class="link" value="cancel">取消</button>
+    <b>用素材创建人设</b>
+    <span></span>
+  </form>
+  <p class="hint">把介绍文档、产品图、讲课录音或视频、公众号链接丢进来，自动整理成一个数字人的身份、说话风格、知识和禁忌。</p>
+  <input id="psName" class="field" placeholder="人设名字，如：王老师-奥数" maxlength="40">
+  <label class="btn btn-tinted">
+    <input id="psFiles" type="file" multiple accept=".pdf,.docx,.txt,.md,.html,image/*,audio/*,video/*" hidden>
+    选择文件（PDF / Word / 文本 / 图片 / 音频 / 视频，可多选）
+  </label>
+  <ul id="psFileList" class="file-list"></ul>
+  <textarea id="psUrls" class="field" rows="2" placeholder="网页链接，一行一个（可选）"></textarea>
+  <input id="psIntro" class="field" placeholder="一句话介绍（可选，没素材时也能先建）" maxlength="300">
+  <input id="psHint" class="field" placeholder="给 AI 的备注，如：这是销售话术（可选）" maxlength="200">
+  <button id="psSubmit" class="btn btn-filled" disabled>开始构建</button>
+  <div id="psProgress" class="progress" hidden></div>
+  <p class="hint">文字直接解析；图片和视频画面走多模态模型，音视频先识别成文字；再由大模型按身份 / 风格 / 知识 / 禁忌整理，最后编译成提示词。几份素材一般 1 分钟左右。</p>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
