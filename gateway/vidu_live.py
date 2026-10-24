@@ -24,7 +24,7 @@ from pathlib import Path
 
 import httpx
 import websockets
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
 import personas
@@ -207,6 +207,21 @@ async def _vidu_voice(c: httpx.AsyncClient, voice: str) -> str:
     return name
 
 
+BUILTIN = [  # (voice, 名字, 说明)
+    ("Tina", "甜甜", "奶茶少女，甜美温暖"), ("Serena", "苏瑶", "温柔的年轻女性"), ("Maia", "四月", "知性又温柔"),
+    ("Liora Mira", "清欢", "有生活温度的女声"), ("Mia", "舒然", "慢生活气质的女声"), ("Katerina", "卡捷琳娜", "成熟御姐"),
+    ("Sunnybobi", "知芝", "随和的邻家女孩"), ("Momo", "茉兔", "搞笑逗趣的女生"), ("Cindy", "林欣宜", "软软的台湾腔女生"),
+    ("Qiao", "小乔妹", "台湾腔甜妹"), ("Angel", "安琪", "带点台湾腔的女声"), ("Mione", "敏儿", "女声"),
+    ("Jennifer", "詹妮弗", "女声"), ("Ethan", "晨煦", "带一点北方口音的标准普通话男声"), ("Theo Calm", "予安", "沉静治愈的男声"),
+    ("Harvey", "厚", "低沉、有岁月感的男声"), ("Evan", "江晨", "男大学生"), ("Raymond", "林川野", "声音清亮的宅男"),
+    ("Li Cassian", "李公公", "话少、会察言观色的男声"), ("Joyner", "阿逗", "搞笑接地气"), ("Wil", "伟伦", "深圳长大、带港味的青年"),
+    ("Ryan", "甜茶", "有节奏感的男声"), ("Aiden", "艾登", "男声"),
+    ("Sunny", "晴儿", "四川话女声"), ("Eric", "程川", "四川话男声"), ("Dylan", "晓东", "北京话男声"),
+    ("Peter", "李彼得", "天津话男声"), ("Marcus", "秦川", "陕西话，话少憨厚的大叔"), ("Li", "老李", "南京话，爱唠叨的老大爷"),
+    ("Joseph Chen", "阿樸伯", "闽南话老伯"), ("Kiki", "阿清", "粤语，甜甜的香港女生"), ("Rocky", "阿强", "粤语，风趣幽默的男声"),
+    ("Sohee", "素熙", "温柔开朗的韩国女生"), ("Ono Anna", "小野杏", "调皮的青梅竹马"), ("Lenn", "莱恩", "理性里带点叛逆"),
+    ("Sonrisa", "索尼莎", "热情的拉丁大姐姐"), ("Bodega", "博德加", "温暖的西班牙大叔"), ("Emilien", "埃米尔安", "浪漫的法国大哥哥"),
+]
 VOICES_JSON = VOICE_DIR / "voices.json"          # 音色库（id/name/group/desc），从合成服务的 presets.json 拷来
 PROFILE_PROMPT = """看这张照片里的人，给"实时视频通话数字人"配人设和音色。
 从下面的音色库里选一个最贴合这个人（性别、年龄、气质）的音色 id：
@@ -377,7 +392,60 @@ async def composed_image(key: str) -> FileResponse:
 
 @router.get("/api/rt/voices")
 async def voices() -> list[dict]:
-    return [{"id": x["id"], "name": f"{x['name']}（{x.get('group', '')}）"} for x in _voices() if x.get("group") != "方言"]
+    """音色列表：our（我们的音色，首次用自动克隆过去）/ builtin（平台内置，值带 v: 前缀）/ mine（自己克隆的，值带 c: 前缀）。"""
+    out = [{"id": x["id"], "name": f"{x['name']}（{x.get('group', '')}）", "group": "our"} for x in _voices() if x.get("group") != "方言"]
+    out += [{"id": f"v:{v}", "name": f"{n}·{d}", "group": "builtin"} for v, n, d in BUILTIN]
+    names = _load().get("custom_names", {})
+    with contextlib.suppress(HTTPException, httpx.HTTPError):
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as c:
+            got = await _api(c, "GET", "/live/v1/voices")
+        for v in got.get("voices") or []:
+            vid = str(v.get("voice") or "")
+            if vid and not vid.startswith("t_"):          # t_ 开头的是我们自动克隆的音色库音色，不重复列
+                out.append({"id": f"c:{vid}", "name": names.get(vid, vid), "group": "mine"})
+    return out
+
+
+@router.post("/api/rt/voices/clone")
+async def clone_voice(audio: UploadFile = File(...), name: str = Form(""), text: str = Form("")) -> dict:
+    """录一段 10~20 秒的声音（或上传音频）→ 克隆成自己的音色。浏览器录的 webm/mp4 先转成 16bit wav。"""
+    raw = await audio.read()
+    if len(raw) < 2000:
+        raise HTTPException(400, "录音太短")
+    if len(raw) > 30_000_000:
+        raise HTTPException(400, "文件太大")
+    p = await asyncio.create_subprocess_exec("ffmpeg", "-v", "error", "-i", "pipe:0", "-t", "30", "-ac", "1", "-ar", "24000",
+                                             "-sample_fmt", "s16", "-f", "wav", "pipe:1",
+                                             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    wav, err = await p.communicate(raw)
+    if p.returncode != 0 or len(wav) < 48000:      # 不到约 1 秒
+        raise HTTPException(400, f"音频读不出来：{err.decode(errors='replace')[:120]}")
+    vid = "u" + uuid.uuid4().hex[:12]
+    body = {"audio_url": "data:audio/wav;base64," + base64.b64encode(wav).decode(), "voice": vid, "language": "zh",
+            "provider": "qwen_omni"}
+    if text.strip():
+        body["text"] = text.strip()[:4000]
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120, connect=10), trust_env=False) as c:
+        r = await _api(c, "POST", "/live/v1/voices/clone", json=body)
+    vid = str(r.get("voice") or vid)
+    cache = _load()
+    cache.setdefault("custom_names", {})[vid] = (name.strip() or "我的声音")[:30]
+    _save(cache)
+    log.info("cloned custom voice %s (%s)", vid, name)
+    return {"id": f"c:{vid}", "name": cache["custom_names"][vid]}
+
+
+@router.delete("/api/rt/voices/{vid}")
+async def delete_voice(vid: str) -> dict:
+    vid = re.sub(r"^c:", "", vid)
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", vid) or vid.startswith("t_"):
+        raise HTTPException(400, "只能删除自己克隆的音色")
+    async with httpx.AsyncClient(timeout=20, trust_env=False) as c:
+        await _api(c, "DELETE", f"/live/v1/voices/{vid}")
+    cache = _load()
+    cache.get("custom_names", {}).pop(vid, None)
+    _save(cache)
+    return {"ok": True}
 
 
 @router.post("/api/rt/profile")
@@ -409,8 +477,12 @@ async def create_live(request: Request) -> dict:
         if not persona:                                 # 没有固定人设的形象 / 新照片：看照片自动配人设和音色
             p = await _auto_profile(_image_bytes(aid, image))
             persona, our_voice = f"{p['persona']}\n{RULES}", p["voice"]
-        if str(body.get("voice") or "") in {v["id"] for v in _voices()}:
-            our_voice = str(body["voice"])              # 页面上手动换了音色
+        direct = ""
+        sel = str(body.get("voice") or "")
+        if sel in {v["id"] for v in _voices()}:
+            our_voice = sel                             # 页面上手动换了我们的音色
+        elif re.fullmatch(r"[vc]:[A-Za-z0-9_ ]{1,32}", sel):
+            direct = sel[2:]                            # 平台内置 / 自己克隆的音色：直接用
         if str(body.get("persona") or "").strip():
             persona = f"{str(body['persona']).strip()}\n{RULES}"
         ck = re.sub(r"[^0-9a-f]", "", str(body.get("compose") or ""))
@@ -419,7 +491,7 @@ async def create_live(request: Request) -> dict:
                 av = await _vidu_avatar(c, f"composed:{ck}")
             else:
                 av = await _vidu_avatar(c, aid) if aid else {"image_uri": image}
-            voice = await _vidu_voice(c, our_voice)
+            voice = direct or await _vidu_voice(c, our_voice)
         req = {
             "model": str(body.get("model") or RT_MODEL), "call_mode": "video",
             "avatar": {**av, "persona": persona[:50000], "voice": voice,

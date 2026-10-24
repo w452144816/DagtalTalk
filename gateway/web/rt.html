@@ -38,6 +38,10 @@
   .vd-photo { display: flex; gap: 12px; align-items: center; }
   .vd-photo img { width: 64px; height: 64px; border-radius: 10px; object-fit: cover; }
   .vd-prof { font-size: 14px; color: var(--sub); }
+  .vd-read { margin: 6px 0; padding: 10px 12px; background: var(--bg); border-radius: 10px; font-size: 15px; line-height: 1.6; }
+  .vd-clone { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0; }
+  .vd-input { width: 100%; font: inherit; font-size: 15px; padding: 9px 12px; margin: 6px 0 10px; border-radius: 10px;
+    border: 0; background: var(--bg); color: var(--text); outline: none; }
   .vd-prof b { color: var(--text); font-weight: 600; }
   .vd-presets { display: flex; gap: 10px; overflow-x: auto; padding: 4px 2px 8px; scrollbar-width: none; }
   .vd-presets::-webkit-scrollbar { display: none; }
@@ -88,10 +92,25 @@
   <section class="group">
     <div class="group-title">人设和音色 <small id="profSrc"></small></div>
     <div class="cell vd-prof" id="profLine">选好形象后自动配上</div>
-    <label class="cell">
+    <div class="cell">
       <span>音色</span>
-      <select id="voice"></select>
-    </label>
+      <div class="voice-pick">
+        <select id="voice"></select>
+        <button id="voiceDel" class="icon-btn danger" type="button" aria-label="删除这个克隆音色" hidden>🗑</button>
+      </div>
+    </div>
+    <details id="cloneCell" class="cell cell-col">
+      <summary>＋ 克隆一个声音 <small class="hint">录 10~20 秒，或上传一段音频</small></summary>
+      <p class="hint">照着念这段（也可以随便说，越自然越好）：</p>
+      <p id="cloneText" class="vd-read">今天天气真好，阳光暖暖的。你最近过得怎么样？工作累不累，有没有按时吃饭？有空多出去走走，也常给家里打打电话。</p>
+      <div class="vd-clone">
+        <button id="recBtn" class="btn btn-tinted" type="button">● 开始录音</button>
+        <label class="btn btn-tinted">选音频文件<input id="cloneFile" type="file" accept="audio/*" hidden></label>
+      </div>
+      <p id="recInfo" class="hint"></p>
+      <input id="cloneName" class="vd-input" type="text" maxlength="30" placeholder="给这个声音起个名字，比如 爸爸的声音">
+      <button id="cloneSubmit" class="btn btn-filled" type="button" disabled>生成音色</button>
+    </details>
     <details class="cell cell-col">
       <summary>人设 <small class="hint">自动生成，可以改</small></summary>
       <textarea id="persona" rows="6" placeholder="正在根据照片生成人设…"></textarea>

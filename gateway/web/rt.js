@@ -107,12 +107,76 @@ async function compose(again = false) {
 $("composeAgain").onclick = () => compose(true);
 
 // ---------------- 人设和音色：形象有固定人设就用它，否则看照片自动配 ----------------
-async function loadVoices() {
+async function loadVoices(select) {
   try {
     const vs = await api("/api/rt/voices");
-    $("voice").innerHTML = vs.map((v) => `<option value="${v.id}">${v.name || v.id}</option>`).join("");
+    const cur = select || $("voice").value;
+    const groups = [["mine", "我克隆的声音"], ["our", "推荐音色"], ["builtin", "平台音色"]];
+    const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    $("voice").innerHTML = groups.map(([g, label]) => {
+      const items = vs.filter((v) => (v.group || "our") === g);
+      return items.length ? `<optgroup label="${label}">${items.map((v) => `<option value="${esc(v.id)}">${esc(v.name || v.id)}</option>`).join("")}</optgroup>` : "";
+    }).join("");
+    if (cur && $("voice").querySelector(`option[value="${CSS.escape(cur)}"]`)) $("voice").value = cur;
   } catch {}
+  voiceDelVisible();
 }
+function voiceDelVisible() { $("voiceDel").hidden = !String($("voice").value).startsWith("c:"); }
+$("voice").onchange = voiceDelVisible;
+$("voiceDel").onclick = async () => {
+  const v = $("voice").value;
+  if (!v.startsWith("c:")) return;
+  $("voiceDel").disabled = true;
+  try { await api(`/api/rt/voices/${encodeURIComponent(v)}`, { method: "DELETE" }); status("已删除这个克隆音色"); await loadVoices(); }
+  catch (e) { status("删除失败：" + e.message); }
+  finally { $("voiceDel").disabled = false; }
+};
+
+// ---------------- 克隆声音：录音或上传 → 服务端转码后克隆 ----------------
+const C = { blob: null, rec: null, chunks: [], t0: 0, timer: 0 };
+function cloneReady() { $("cloneSubmit").disabled = !C.blob; }
+$("recBtn").onclick = async () => {
+  if (C.rec && C.rec.state === "recording") { C.rec.stop(); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    C.chunks = []; C.rec = new MediaRecorder(stream);
+    C.rec.ondataavailable = (e) => { if (e.data.size) C.chunks.push(e.data); };
+    C.rec.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop()); clearInterval(C.timer);
+      C.blob = new Blob(C.chunks, { type: C.rec.mimeType || "audio/webm" });
+      const sec = Math.round((Date.now() - C.t0) / 1000);
+      $("recInfo").textContent = sec < 8 ? `只录了 ${sec} 秒，建议 10~20 秒` : `录好了，${sec} 秒`;
+      $("recBtn").textContent = "● 重新录音"; cloneReady();
+    };
+    C.rec.start(); C.t0 = Date.now(); $("recBtn").textContent = "■ 停止录音";
+    C.timer = setInterval(() => {
+      const sec = Math.round((Date.now() - C.t0) / 1000);
+      $("recInfo").textContent = `正在录音… ${sec} 秒`;
+      if (sec >= 30) C.rec.stop();
+    }, 500);
+  } catch (e) { $("recInfo").textContent = "打不开麦克风：" + e.message; }
+};
+$("cloneFile").onchange = () => {
+  const f = $("cloneFile").files[0];
+  if (!f) return;
+  C.blob = f; $("recInfo").textContent = `已选文件：${f.name}`; cloneReady();
+};
+$("cloneSubmit").onclick = async () => {
+  if (!C.blob) return;
+  $("cloneSubmit").disabled = true; $("recInfo").textContent = "正在生成音色，约十几秒…";
+  try {
+    const fd = new FormData();
+    fd.append("audio", C.blob, C.blob.name || "voice.webm");
+    fd.append("name", $("cloneName").value.trim());
+    fd.append("text", $("cloneText").textContent.trim());
+    const r = await fetch("/api/rt/voices/clone", { method: "POST", body: fd });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || r.statusText);
+    await loadVoices(d.id);
+    $("recInfo").textContent = `已生成「${d.name}」，选上了`; $("cloneCell").open = false; C.blob = null;
+  } catch (e) { $("recInfo").textContent = "生成失败：" + e.message; }
+  finally { cloneReady(); }
+};
 async function loadProfile() {
   const seq = ++S.profSeq;
   if (!S.avatarId && !S.photo) return;
@@ -125,7 +189,8 @@ async function loadProfile() {
     if (p.voice && !$("voice").querySelector(`option[value="${p.voice}"]`)) {
       $("voice").insertAdjacentHTML("afterbegin", `<option value="${p.voice}">${p.voice_name || p.voice}</option>`);
     }
-    if (p.voice) $("voice").value = p.voice;
+    if (p.voice && !/^[vc]:/.test($("voice").value)) $("voice").value = p.voice;
+    voiceDelVisible();
     const who = p.source === "preset" ? (p.name || "固定人设") : [p.name, p.gender, p.age ? `约 ${p.age} 岁` : "", p.look].filter(Boolean).join(" · ");
     $("profLine").innerHTML = `<span><b></b>　音色：<b></b></span>`;
     $("profLine").querySelectorAll("b")[0].textContent = who || "自动配置";
