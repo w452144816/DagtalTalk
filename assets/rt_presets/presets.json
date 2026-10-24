@@ -1,0 +1,54 @@
+{
+ "bg": [
+  {
+   "id": "home",
+   "name": "温馨客厅"
+  },
+  {
+   "id": "yard",
+   "name": "农家小院"
+  },
+  {
+   "id": "park",
+   "name": "公园湖边"
+  },
+  {
+   "id": "balcony",
+   "name": "阳光阳台"
+  },
+  {
+   "id": "kitchen",
+   "name": "家里厨房"
+  },
+  {
+   "id": "study",
+   "name": "安静书房"
+  }
+ ],
+ "outfit": [
+  {
+   "id": "cardigan",
+   "name": "米色开衫"
+  },
+  {
+   "id": "tang",
+   "name": "中式棉袄"
+  },
+  {
+   "id": "shirt",
+   "name": "格子衬衫"
+  },
+  {
+   "id": "vest",
+   "name": "毛线背心"
+  },
+  {
+   "id": "coat",
+   "name": "呢子大衣"
+  },
+  {
+   "id": "floral",
+   "name": "碎花上衣"
+  }
+ ]
+}

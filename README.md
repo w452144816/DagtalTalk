@@ -142,3 +142,15 @@ curl -sk https://<GPU1_LAN_IP>:8443/health      # 各节点实例、在线数、
 - 实测（Chrome getStats）：修前 Δplayout 34~184 秒乱跳、待机时音频全靠浏览器补帧；修后 Δplayout 0~2ms，
   跨待机、第二句、说话中途打断都稳定，Chrome 自动把视频缓冲目标从 21ms 调到 66ms 去对齐音频。
 - 浏览器端自测：通话中在控制台跑 `S.pc.getStats()`，比较 audio / video inbound-rtp 的 estimatedPlayoutTimestamp。
+## 全身实时通话（`gateway/vidu_live.py`，页面 `/rt`）
+
+第二种通话方式：整个人由第三方实时数字人（Vidu S 实时版）生成，头、表情、身体一起动。语音识别、对话模型、合成、渲染和 RTC 都在对方那边，我们只提供照片、人设、音色和控制通道；按通话时长计费（1.5 点/秒）。页面上不出现供应商名字。
+
+- **流程**：页面选形象/照片 → `POST /api/rt/profile` 自动配人设和音色（形象有固定人设就用它，否则多模态模型看照片生成，并从音色库挑最贴合的；所选音色首次自动克隆）→ 选了背景/服装就 `POST /api/rt/compose` 先生成一张换好装的照片（参考生图，脸相似度实测 0.82~0.97）→ `POST /api/rt/live` 建会话（返回阿里云 RTC 入会凭证）→ 页面用 AliRTC Web SDK 入会收发音视频，控制信号走 `WS /api/rt/ws/{live_id}`（服务端代理，浏览器 WebSocket 不能带鉴权头）。
+- **稳定性**：背景/服装在通话前换进照片，通话中不换（实测通话中换参考图会让脸变年轻、衣服像平铺图贴上去）；所有形象只用细微待机动作，关闭按对方话语匹配动作；人设规则要求只说话、不拿东西；默认模型 `RT_MODEL=vidu-s1`（通话中脸的稳定性比 s2 好）；页面不提供打字输入（文字是对方"控制数字人行为"的通道）；同一个用户同时只保留一个会话；浏览器断开自动挂断，没人说话 5 分钟自动断。
+- **已知限制**：对方的视频模型会照用户的话直接做动作（如"戴眼镜、拿杯子"会真的戴上/拿出来），现有接口参数挡不住；根治需要换"组件版"（我们自己的识别/对话/合成，对方只渲染推流，需要自己的阿里云 RTC 应用）。
+- **部署准备**：
+  - 密钥：写到控制面 `/w/state/vidu.key`（或环境变量 `VIDU_API_KEY`），不进代码库。
+  - 音色样音：把合成服务的预设音色 `presets/<id>.wav` 和 `presets.json` 拷到 `/w/data/vidu_voices/`（`voices.json` 为音色库，`<id>.txt` 为样音文本）。
+  - 预设背景/服装：`assets/rt_presets/` 拷到 `/w/data/rt_presets/`，或在控制面容器里跑 `scripts/rt_presets.py` 重新生成（MiniMax 生图）。
+- **测试工具**：`scripts/rt_bargein_test.py`（打断后再提问，开录像）、`scripts/rt_mouth_motion.py`（录像里每秒嘴部动作量和脸部相似度）；建会话时传内部参数 `record: true` 可在结束后用 `GET /api/rt/lives/{id}/recording` 下载整场录像。
